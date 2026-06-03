@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rast Flow AI — AI Powered Video Editing</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ── Header ───────────────────────────────────────────── -->
+  <div class="header">
+    <img src="./assets/logo.png" alt="Rast Flow AI" class="header-logo-img" id="headerLogo">
+    <div class="header-spacer"></div>
+    <div class="icon-btn" id="settingsBtn" title="Ayarlar">⚙</div>
+  </div>
+
+  <!-- ── Tab strip ────────────────────────────────────────── -->
+  <div class="tab-bar">
+    <div class="tab active" data-panel="panelTranscript">Transkript</div>
+    <div class="tab"        data-panel="panelEdit">Kurgu</div>
+    <div class="tab"        data-panel="panelSubtitle">Altyazı</div>
+  </div>
+
+  <!-- ══════════ PANEL: TRANSKRİPT ══════════ -->
+  <div class="tab-panel active" id="panelTranscript">
+
+    <div class="transcript-toolbar">
+      <button class="btn btn-primary" id="transcribeBtn">✦ Transkript Oluştur</button>
+      <button class="btn btn-secondary btn-sm" title="Tümünü seç"
+        onclick="document.querySelectorAll('.word').forEach(w=>w.classList.add('selected'))">☑</button>
+      <button class="btn btn-secondary btn-sm" title="Seçimi temizle"
+        onclick="document.querySelectorAll('.word').forEach(w=>w.classList.remove('selected'))">☐</button>
+      <button class="btn btn-secondary btn-sm" title="Kopyala" onclick="
+        const t=Array.from(document.querySelectorAll('.word')).map(w=>w.textContent).join(' ');
+        navigator.clipboard.writeText(t); UIController.toast('Panoya kopyalandı.','success');">⧉</button>
+      <div class="silence-control">
+        <span>Sessizlik</span>
+        <input type="number" id="silenceThreshold" value="0.4" min="0.1" max="5" step="0.1">
+        <span>s</span>
+      </div>
+    </div>
+
+    <div class="progress-bar" style="margin:0 16px 10px;"><div class="progress-fill"></div></div>
+
+    <div class="transcript-wrap">
+      <div class="transcript-area" id="transcriptArea">
+        <div class="empty-state">
+          <div class="empty-state-icon">✦</div>
+          <div class="empty-state-title">Transkript Bekleniyor</div>
+          <div class="empty-state-desc">
+            Timeline'da klibini hazırla ve<br><b>Transkript Oluştur</b>'a bas.
+          </div>
+        </div>
+      </div>
+      <div class="stats-bar">
+        <span class="stat-item"><span>Kelime</span><span class="stat-value" id="statWordCount">0</span></span>
+        <span class="stat-sep">·</span>
+        <span class="stat-item"><span>Silinen</span><span class="stat-value" id="statDeletedCount">0</span></span>
+        <span class="stat-sep">·</span>
+        <span class="stat-item"><span>Segment</span><span class="stat-value" id="statSegCount">0</span></span>
+        <span class="stat-sep">·</span>
+        <span class="stat-item"><span>Süre</span><span class="stat-value" id="statDuration">00:00</span></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════ PANEL: KURGU ══════════ -->
+  <div class="tab-panel" id="panelEdit">
+    <div class="scroll">
+
+      <!-- Sessizlik Kaldırma -->
+      <div class="section">
+        <div class="section-title">Sessizlik Kaldırma</div>
+        <div class="row">
+          <div class="field">
+            <label>Eşik süresi (s)</label>
+            <input type="number" id="silenceThreshold2" value="0.4" min="0.05" max="5" step="0.05">
+          </div>
+          <div class="field">
+            <label>Tespit edilen</label>
+            <div class="silence-stat-row">
+              <span id="silenceCount" class="silence-stat-val">—</span>
+            </div>
+          </div>
+          <div class="field">
+            <label>Toplam süre</label>
+            <div class="silence-stat-row">
+              <span id="silenceTotalDur" class="silence-stat-val">—</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="silence-help">
+          <span class="silence-help-icon">💡</span>
+          Transkript panelindeki turuncu <b>■</b> kutulara tıklayarak tek tek, ya da aşağıdaki butonla tümünü silim listesine ekleyin.
+        </div>
+
+        <div class="btn-group" style="margin-top:10px;">
+          <button class="btn btn-secondary btn-full" id="scanSilenceBtn">🔍 Sessizlikleri Tara</button>
+          <button class="btn btn-secondary btn-full" id="deleteAllSilenceBtn">+ Tümünü Listeye Ekle</button>
+        </div>
+      </div>
+
+      <!-- Tekrar Avcısı -->
+      <div class="section">
+        <div class="section-title">Tekrar Avcısı</div>
+        <div class="field">
+          <label>Yöntem</label>
+          <select id="repeatMethod">
+            <option value="exact">Birebir aynı (ardışık)</option>
+            <option value="fuzzy">Benzer kelime (bulanık eşleşme)</option>
+          </select>
+        </div>
+        <button class="btn btn-secondary btn-full" id="scanRepeatBtn">🔍 Tekrarları Tara</button>
+      </div>
+
+      <!-- Filler Kelimeler -->
+      <div class="section">
+        <div class="section-title">Filler Kelimeler</div>
+        <div id="fillerChips" class="chip-list"></div>
+        <button class="btn btn-secondary btn-full" id="markFillerBtn" style="margin-top:11px;">Filler İşaretle</button>
+      </div>
+
+      <!-- Premiere'e Uygula -->
+      <div class="section">
+        <div class="section-title">Premiere'e Uygula</div>
+        <div class="field">
+          <div class="toggle-row">
+            <span class="toggle-label">Ripple Delete (boşluk kapat)</span>
+            <label class="toggle"><input type="checkbox" id="rippleDeleteToggle" checked><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+        <div class="field">
+          <div class="toggle-row">
+            <span class="toggle-label">Tüm kanalları etkile</span>
+            <label class="toggle"><input type="checkbox" id="allTracksToggle" checked><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+        <button class="btn btn-danger btn-full" id="applyDeleteBtn" style="margin-top:6px;">✂ Kesimi Uygula</button>
+        <div class="hint">Geri almak için Premiere'de Ctrl+Z.</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════ PANEL: ALTYAZI ══════════ -->
+  <div class="tab-panel" id="panelSubtitle">
+    <div class="scroll">
+
+      <div class="section">
+        <div class="section-title">Önizleme</div>
+        <div class="subtitle-preview">
+          <div class="subtitle-preview-text" id="subtitlePreviewText">Kelime <span class="hl">kelime</span> animasyon</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Tipografi</div>
+        <div class="row">
+          <div class="field">
+            <label>Font</label>
+            <select id="fontFamilySelect">
+              <option value="Arial" selected>Arial</option>
+              <option value="Helvetica">Helvetica</option>
+              <option value="Impact">Impact</option>
+              <option value="Georgia">Georgia</option>
+              <option value="Trebuchet MS">Trebuchet MS</option>
+              <option value="Verdana">Verdana</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Boyut (px)</label>
+            <input type="number" id="fontSizeInput" value="48" min="12" max="200">
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Renkler</div>
+        <div class="field">
+          <label>Metin Rengi</label>
+          <div class="row" style="align-items:center">
+            <input type="color" id="textColorInput" value="#FFFFFF" style="width:40px;flex:0 0 auto;">
+            <div class="color-swatch" style="flex:1;">
+              <div class="color-option selected" style="background:#fff" data-target="textColor" data-color="#FFFFFF"></div>
+              <div class="color-option" style="background:#1b1715" data-target="textColor" data-color="#1B1715"></div>
+              <div class="color-option" style="background:#f0431e" data-target="textColor" data-color="#F0431E"></div>
+              <div class="color-option" style="background:#ff6b3d" data-target="textColor" data-color="#FF6B3D"></div>
+            </div>
+          </div>
+        </div>
+        <div class="field">
+          <label>Vurgu Rengi (Aktif Kelime)</label>
+          <div class="row" style="align-items:center">
+            <input type="color" id="highlightColorInput" value="#FF6B3D" style="width:40px;flex:0 0 auto;">
+            <div class="color-swatch" style="flex:1;">
+              <div class="color-option selected" style="background:#ff6b3d" data-target="highlightColor" data-color="#FF6B3D"></div>
+              <div class="color-option" style="background:#f0431e" data-target="highlightColor" data-color="#F0431E"></div>
+              <div class="color-option" style="background:#ffd400" data-target="highlightColor" data-color="#FFD400"></div>
+              <div class="color-option" style="background:#4fb477" data-target="highlightColor" data-color="#4FB477"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Kenarlık & Gölge</div>
+        <div class="row">
+          <div class="field">
+            <label>Stroke (px)</label>
+            <input type="number" id="strokeWidthInput" value="2" min="0" max="20">
+          </div>
+          <div class="field">
+            <label>Stroke Rengi</label>
+            <input type="color" id="strokeColorInput" value="#1B1715">
+          </div>
+        </div>
+        <div class="field">
+          <div class="toggle-row">
+            <span class="toggle-label">Gölge Efekti</span>
+            <label class="toggle"><input type="checkbox" id="shadowToggle" checked><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Ekran Konumu</div>
+        <div class="field">
+          <label>Dikey: <span id="posYLabel">85</span>%</label>
+          <input type="range" id="positionYInput" min="5" max="95" value="85"
+            oninput="document.getElementById('posYLabel').textContent=this.value">
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">Animasyon</div>
+        <div class="field">
+          <div class="toggle-row">
+            <span class="toggle-label">Bounce / Pop-up</span>
+            <label class="toggle"><input type="checkbox" id="bounceToggle" checked><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+        <div class="field">
+          <div class="toggle-row">
+            <span class="toggle-label">Kelime kelime vurgu</span>
+            <label class="toggle"><input type="checkbox" id="highlightToggle" checked><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+        <div class="field">
+          <label>Görünüm Modu</label>
+          <select id="subtitleModeSelect">
+            <option value="word" selected>Kelime Kelime</option>
+            <option value="line">Satır Satır</option>
+            <option value="full">Tüm Metin</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- SRT Oluştur -->
+      <button class="btn btn-success btn-full btn-lg" id="generateSubtitlesBtn">🎬 SRT Altyazı Oluştur</button>
+      <div class="hint" style="text-align:center;margin-top:8px;">
+        SRT dosyası oluşturur → Premiere projesine otomatik aktarır
+      </div>
+
+      <!-- SRT Dosya Yolu (oluşturulduktan sonra görünür) -->
+      <div id="srtPathSection" class="section" style="display:none;margin-top:12px;">
+        <div class="section-title">Oluşturulan Dosya</div>
+        <div class="srt-path-box">
+          <span class="srt-path-icon">📄</span>
+          <span id="srtFilePath" class="srt-path-text">—</span>
+        </div>
+        <div class="hint" style="margin-top:6px;">
+          Dosya Premiere Proje panelinizde görünecektir.<br>
+          Görünmüyorsa yukarıdaki yoldan manuel sürükleyin.
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</div><!-- /#app -->
+
+<!-- ══════════ AYARLAR ÇEKMECESİ ══════════ -->
+<div class="drawer-backdrop" id="settingsBackdrop"></div>
+<div class="drawer" id="settingsDrawer">
+  <div class="drawer-head">
+    <img src="./assets/logo.png" alt="Rast Flow AI" style="height:22px;object-fit:contain;">
+    <div class="drawer-title">Ayarlar</div>
+    <div class="header-spacer"></div>
+    <div class="icon-btn" id="settingsClose" title="Kapat">✕</div>
+  </div>
+  <div class="drawer-body">
+
+    <div class="section">
+      <div class="section-title">OpenAI Bağlantısı</div>
+      <div class="field">
+        <label>API Key <span class="status-dot" id="apiStatusDot"></span></label>
+        <div class="api-key-wrapper">
+          <input type="password" id="apiKeyInput" placeholder="sk-••••••••••••">
+          <button class="btn btn-secondary btn-sm" id="apiKeyToggle" title="Göster">👁</button>
+          <button class="btn btn-primary btn-sm" id="apiKeySave">Kaydet</button>
+        </div>
+        <div class="hint">🔒 AES-256 ile şifrelenip cihazına özgü anahtarla saklanır — paylaşsan bile güvende.</div>
+      </div>
+      <div class="field">
+        <label>Dil</label>
+        <select id="languageSelect">
+          <option value="tr" selected>Türkçe</option>
+          <option value="en">English</option>
+          <option value="de">Deutsch</option>
+          <option value="fr">Français</option>
+          <option value="es">Español</option>
+          <option value="auto">Otomatik Algıla</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Kaynak & Aralık</div>
+      <div class="field">
+        <div class="toggle-row">
+          <span class="toggle-label">Sadece In/Out aralığı</span>
+          <label class="toggle"><input type="checkbox" id="inOutOnly" checked><span class="toggle-slider"></span></label>
+        </div>
+      </div>
+      <button class="btn btn-secondary btn-full" id="refreshSeqBtn" onclick="
+        const cs=window.getCSInterface&&getCSInterface();
+        if(cs){cs.evalScript('getSequenceInfo()',r=>{try{const d=JSON.parse(r);
+        document.getElementById('seqInfo').textContent=d.success?d.name+' — '+d.videoTracks+'V / '+d.audioTracks+'A — '+d.duration.toFixed(1)+'s':'Sekans yok';}catch(e){document.getElementById('seqInfo').textContent='Hata';}});}
+        else{document.getElementById('seqInfo').textContent='CEP yok (geliştirme)';}">Sekans Bilgisini Al</button>
+      <div id="seqInfo" class="hint" style="margin-top:7px;font-family:ui-monospace,monospace;">—</div>
+    </div>
+
+    <div class="section" style="display:none;">
+      <div class="section-title">Ses (otomatik)</div>
+      <select id="sampleRateSelect"><option value="16000" selected>16000</option></select>
+      <select id="channelSelect"><option value="1" selected>Mono</option></select>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Günlük</div>
+      <div id="logPanel" class="log-panel"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Loading / Toast ── -->
+<div id="loadingOverlay" class="loading-overlay" style="display:none;">
+  <div class="spinner"></div>
+  <div class="loading-text" id="loadingText">İşleniyor…</div>
+</div>
+<div id="toastContainer" class="toast-container"></div>
+
+<script src="CSInterface.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.pr.workflow" ExtensionBundleVersion="1.0.0" ExtensionBundleName="PR Workflow AI">
+  <ExtensionList>
+    <Extension Id="com.pr.workflow.panel" Version="1.0.0"/>
+  </ExtensionList>
+
+  <ExecutionEnvironment>
+    <HostList>
+      <!-- Premiere Pro 2023 (v23.x) -->
+      <Host Name="PPRO" Version="[23.0,27.9]"/>
+    </HostList>
+    <LocaleList>
+      <Locale Code="All"/>
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="11.0"/>
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+
+  <DispatchInfoList>
+    <Extension Id="com.pr.workflow.panel">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./client/index.html</MainPath>
+          <ScriptPath>./host/index.jsx</ScriptPath>
+          <CEFCommandLine>
+            <Parameter>--enable-nodejs</Parameter>
+            <Parameter>--mixed-context</Parameter>
+            <Parameter>--disable-web-security</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>PR Workflow AI</Menu>
+          <Geometry>
+            <Size>
+              <Height>650</Height>
+              <Width>380</Width>
+            </Size>
+            <MinSize>
+              <Height>500</Height>
+              <Width>320</Width>
+            </MinSize>
+            <MaxSize>
+              <Height>2000</Height>
+              <Width>800</Width>
+            </MaxSize>
+          </Geometry>
+          <Icons>
+            <Icon Type="Normal">./client/assets/icon_normal.png</Icon>
+            <Icon Type="RollOver">./client/assets/icon_hover.png</Icon>
+          </Icons>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

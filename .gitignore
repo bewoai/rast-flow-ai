@@ -1,0 +1,28 @@
+# Temporary audio files
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.aac
+
+# Premiere / OS temp files
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+
+# Subtitles
+*.srt
+*.vtt
+*.ass
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Node modules
+node_modules/
+dist/
