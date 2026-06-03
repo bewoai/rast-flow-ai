@@ -22,6 +22,7 @@
     <div class="tab active" data-panel="panelTranscript">Transkript</div>
     <div class="tab"        data-panel="panelEdit">Kurgu</div>
     <div class="tab"        data-panel="panelSubtitle">Altyazı</div>
+    <div class="tab"        data-panel="panelAiEditor">AI Editör</div>
   </div>
 
   <!-- ══════════ PANEL: TRANSKRİPT ══════════ -->
@@ -29,6 +30,7 @@
 
     <div class="transcript-toolbar">
       <button class="btn btn-primary" id="transcribeBtn">✦ Transkript Oluştur</button>
+      <button class="btn btn-secondary btn-sm" id="autoSegmentBtn" title="Otomatik böl">🪄</button>
       <button class="btn btn-secondary btn-sm" title="Tümünü seç"
         onclick="document.querySelectorAll('.word').forEach(w=>w.classList.add('selected'))">☑</button>
       <button class="btn btn-secondary btn-sm" title="Seçimi temizle"
@@ -116,11 +118,13 @@
         <div class="field">
           <label>Yöntem</label>
           <select id="repeatMethod">
+            <option value="sliding">sliding Kayan Pencere</option>
             <option value="exact">Birebir aynı (ardışık)</option>
             <option value="fuzzy">Benzer kelime (bulanık eşleşme)</option>
           </select>
         </div>
         <button class="btn btn-secondary btn-full" id="scanRepeatBtn">🔍 Tekrarları Tara</button>
+        <div id="repeatList" class="repeat-list"></div>
       </div>
 
       <!-- Filler Kelimeler -->
@@ -297,8 +301,61 @@
         </div>
       </div>
 
-      <!-- SRT Oluştur -->
-      <button class="btn btn-success btn-full btn-lg" id="generateSubtitlesBtn">🎬 SRT Altyazı Oluştur</button>
+      <!-- Altyazı Tarzı & Gelişmiş Stil -->
+      <div class="section">
+        <div class="section-title">Altyazı Tarzı</div>
+
+        <div class="field">
+          <label>Tarz</label>
+          <select id="subtitleStyleSelect">
+            <option value="corporate">Kurumsal / Sade</option>
+            <option value="dynamic">Dinamik / Animasyonlu</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <div class="toggle-row">
+            <span class="toggle-label">Arka Plan Metin Kutusu (Box)</span>
+            <label class="toggle"><input type="checkbox" id="bgBoxToggle"><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+
+        <div id="bgBoxSettings" class="bg-box-settings">
+          <div class="row">
+            <div class="field">
+              <label>Kutu Rengi</label>
+              <input type="color" id="bgBoxColor" value="#000000">
+            </div>
+            <div class="field">
+              <label>Opaklık: <span id="bgOpacityLabel">75</span>%</label>
+              <input type="range" id="bgOpacityInput" min="0" max="100" value="75"
+                oninput="document.getElementById('bgOpacityLabel').textContent=this.value">
+            </div>
+          </div>
+        </div>
+
+        <div class="field" style="margin-top:8px;">
+          <label>Pasif Kelime Rengi</label>
+          <input type="color" id="passiveColorInput" value="#AAAAAA">
+        </div>
+
+        <div class="field">
+          <div class="toggle-row">
+            <span class="toggle-label">Büyük Harf (ALL CAPS)</span>
+            <label class="toggle"><input type="checkbox" id="allCapsToggle"><span class="toggle-slider"></span></label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Dışa Aktarma Butonları -->
+      <div class="btn-group" style="margin-bottom:8px;">
+        <button class="btn btn-primary btn-full" id="injectTimelineBtn" style="flex:1.2;">✦ Timeline'a Ekle</button>
+        <button class="btn btn-success btn-full" id="generateSubtitlesBtn" style="flex:1;">📄 SRT İndir</button>
+      </div>
+      <div class="hint" style="text-align:center;">
+        <b>Timeline'a Ekle</b>: Premiere'de Essential Graphics klipleri oluşturur.<br>
+        <b>SRT İndir</b>: Harici .srt dosyası üretir.
+      </div>
       <div class="hint" style="text-align:center;margin-top:8px;">
         SRT dosyası oluşturur → Premiere projesine otomatik aktarır
       </div>
@@ -313,6 +370,57 @@
         <div class="hint" style="margin-top:6px;">
           Dosya Premiere Proje panelinizde görünecektir.<br>
           Görünmüyorsa yukarıdaki yoldan manuel sürükleyin.
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════ PANEL: AI EDİTÖR ══════════ -->
+  <div class="tab-panel" id="panelAiEditor">
+    <div class="scroll">
+
+      <div class="section">
+        <div class="section-title">AI Bağlantısı</div>
+        <div class="field">
+          <label>API Anahtarı</label>
+          <div class="api-key-wrapper">
+            <input type="password" id="aiApiKey" placeholder="sk-… veya sk-ant-…">
+            <button class="btn btn-secondary btn-sm" id="aiKeyToggle" title="Göster">👁</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>Model</label>
+          <select id="aiModelSelect">
+            <option value="gpt-4o">GPT-4o</option>
+            <option value="gpt-4o-mini">GPT-4o Mini</option>
+            <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+            <option value="claude-opus-4-8">Claude Opus 4.8</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">AI Temizleme</div>
+        <button class="btn btn-primary btn-full" id="runAiCleanBtn">🪄 Transkripti AI ile Temizle</button>
+        <div id="aiStatusBar" class="hint" style="margin-top:8px;text-align:center;">—</div>
+        <div id="aiStats" class="ai-stats" style="display:none;">
+          <span>Silinen: <b id="aiDeletedCount">0</b></span>
+          <span>Sebep: <b id="aiReasonCount">0</b></span>
+        </div>
+      </div>
+
+      <div class="section" id="aiReasonsSection" style="display:none;">
+        <div class="section-title">Tespit Edilen Kesimler</div>
+        <div id="aiReasonsList" class="ai-reasons-list"></div>
+      </div>
+
+      <div class="section">
+        <div class="section-title">İpucu</div>
+        <div class="silence-help">
+          <span class="silence-help-icon">🤖</span>
+          AI, kekelemeleri, dolgu sesleri ve hatalı çekimleri (multi-take) tespit ederek transkripti temizler.
+          Sonuçları inceleyip onayladıktan sonra <b>Kurgu</b> sekmesinden Premiere'e uygulayabilirsiniz.
         </div>
       </div>
 
