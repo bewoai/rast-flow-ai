@@ -167,9 +167,17 @@ const APIManager = (() => {
       : 'Tüm sekans Whisper\'a gönderiliyor…';
     onProgress && onProgress(30, rangeMsg);
 
-    const words = await _sendToWhisper(filePath, key, language, (p) => {
-      onProgress && onProgress(30 + Math.round(p * 60), 'Transkript alınıyor…');
-    });
+    let words;
+    if (src.duration > 900) {
+      onProgress && onProgress(30, `Uzun ses (${(src.duration / 60).toFixed(1)} dk) — 10 dakikalık parçalara bölünüyor…`);
+      words = await _transcribeInChunks(filePath, key, language, src.duration, (p, msg) => {
+        onProgress && onProgress(30 + Math.round(p * 60), msg);
+      });
+    } else {
+      words = await _sendToWhisper(filePath, key, language, (p) => {
+        onProgress && onProgress(30 + Math.round(p * 60), 'Transkript alınıyor…');
+      });
+    }
 
     if (baseOffset > 0) {
       words.forEach(w => {
@@ -180,6 +188,47 @@ const APIManager = (() => {
 
     onProgress && onProgress(100, 'Tamamlandı.');
     return words;
+  }
+
+  async function _transcribeInChunks(filePath, apiKey, language, totalDuration, onProgress) {
+    if (typeof require !== 'function') throw new Error('Node.js entegrasyonu yok.');
+    const fs   = require('fs');
+    const path = require('path');
+    const os   = require('os');
+    const cp   = require('child_process');
+    const ff   = _findFfmpeg();
+    const CHUNK = 600; // 10 dakika (saniye)
+    const allWords = [];
+    const numChunks = Math.ceil(totalDuration / CHUNK);
+
+    for (let i = 0; i < numChunks; i++) {
+      const offset  = i * CHUNK;
+      const dur     = Math.min(CHUNK, totalDuration - offset);
+      const chunkWav = path.join(os.tmpdir(), `rastflow_chunk_${Date.now()}_${i}.wav`);
+
+      // Input-seeking ile parça çıkar (hızlı)
+      await new Promise((resolve, reject) => {
+        const args = ['-ss', String(offset), '-i', filePath,
+          '-t', String(dur), '-vn', '-ac', '1', '-ar', '16000',
+          '-c:a', 'pcm_s16le', '-y', chunkWav];
+        cp.execFile(ff, args, { maxBuffer: 1 << 28 }, err => err ? reject(new Error(err.message)) : resolve());
+      });
+
+      onProgress && onProgress(i / numChunks, `Parça ${i + 1}/${numChunks} Whisper'a gönderiliyor…`);
+
+      const chunkWords = await _sendToWhisper(chunkWav, apiKey, language, null);
+      chunkWords.forEach(w => {
+        allWords.push({
+          ...w,
+          start: parseFloat((w.start + offset).toFixed(3)),
+          end  : parseFloat((w.end   + offset).toFixed(3))
+        });
+      });
+
+      try { fs.unlinkSync(chunkWav); } catch (e) {}
+    }
+
+    return allWords;
   }
 
   async function _sendToWhisper(filePath, apiKey, language, onProgress) {
@@ -322,8 +371,8 @@ const APIManager = (() => {
       try {
         await new Promise((resolve, reject) => {
           const args = [
+            '-ss', String(srcStart),   // input-seeking: -i'den ÖNCE (10x hızlı)
             '-i', srcPath,
-            '-ss', String(srcStart),
             '-t',  String(duration),
             '-vn', '-ac', '1', '-ar', '16000',
             '-c:a', 'pcm_s16le',
@@ -475,11 +524,34 @@ const TranscriptStore = (() => {
   let _words     = [];
   let _segments  = [];
   let _listeners = [];
+  let _undoStack = [];
 
   function load(wordsArray) {
     _words    = wordsArray.map(w => ({ ...w, deleted: false, filler: false, repeat: false }));
     _segments = [];
+    _undoStack = [];
     _notify();
+  }
+
+  function pushUndo(ids) {
+    const snapshot = (ids || _words.map(w => w.id)).map(id => {
+      const w = _words.find(x => x.id === id);
+      return w ? { ...w } : null;
+    }).filter(Boolean);
+    if (!snapshot.length) return;
+    if (_undoStack.length >= 10) _undoStack.shift();
+    _undoStack.push(snapshot);
+  }
+
+  function undo() {
+    const snapshot = _undoStack.pop();
+    if (!snapshot) return false;
+    snapshot.forEach(saved => {
+      const w = _words.find(x => x.id === saved.id);
+      if (w) Object.assign(w, saved);
+    });
+    _notify();
+    return true;
   }
 
   function getWords(includeDeleted = false) {
@@ -495,17 +567,17 @@ const TranscriptStore = (() => {
 
   function deleteWord(id) {
     const w = _words.find(x => x.id === id);
-    if (w) { w.deleted = true; _notify(); }
+    if (w && !w.deleted) { pushUndo([id]); w.deleted = true; _notify(); }
   }
 
   function restoreWord(id) {
     const w = _words.find(x => x.id === id);
-    if (w) { w.deleted = false; _notify(); }
+    if (w) { w.deleted = false; w.repeat = false; w.filler = false; _notify(); }
   }
 
   function markFiller(id, value) {
     const w = _words.find(x => x.id === id);
-    if (w) { w.filler = value !== undefined ? value : !w.filler; _notify(); }
+    if (w) { pushUndo([id]); w.filler = value !== undefined ? value : !w.filler; _notify(); }
   }
 
   function markRepeat(id, value) {
@@ -612,7 +684,8 @@ const TranscriptStore = (() => {
     load, getWords, getSegments, updateWord, deleteWord, restoreWord,
     markFiller, markRepeat, insertWordAfter,
     addSegmentBreak, removeSegmentBreak,
-    getSegmentedWords, getDeleteRanges, onChange, notifyAll
+    getSegmentedWords, getDeleteRanges,
+    pushUndo, undo, onChange, notifyAll
   };
 })();
 
@@ -641,7 +714,6 @@ const TranscriptEditor = (() => {
 
   function render(words, segments) {
     if (!_container) return;
-    _container.innerHTML = '';
 
     if (!words || words.length === 0) {
       _container.innerHTML = `
@@ -653,68 +725,93 @@ const TranscriptEditor = (() => {
       return;
     }
 
-    const silences      = SilenceRemover.getDetectedSilences() || [];
-    const segmentBreaks = new Set((segments || []).map(s => s.afterWordId));
-    const fragment      = document.createDocumentFragment();
-    const activeWords   = words.filter(w => !w.deleted);
+    const silences = SilenceRemover.getDetectedSilences() || [];
+    const groups   = TranscriptStore.getSegmentedWords();
+    const fragment = document.createDocumentFragment();
 
-    activeWords.forEach((w, idx) => {
-      // Find silences falling between prevActive and w
-      if (idx > 0) {
-        const prevActive = activeWords[idx - 1];
-        const midSilences = silences.filter(s => s.start >= prevActive.end - 0.05 && s.end <= w.start + 0.05);
-        midSilences.forEach(s => {
-          const marker = document.createElement('span');
-          marker.className = 'silence-band';
-          const isQueued = UIController.isSilenceQueued(s);
-          if (isQueued) marker.classList.add('queued');
-          
-          marker.dataset.start = s.start;
-          marker.dataset.end = s.end;
-          marker.dataset.dur = s.duration;
-          marker.title = `${s.duration.toFixed(2)}s sessizlik — Tıkla: sil listesine ekle/kaldır`;
-          
-          const width = Math.min(80, Math.max(12, s.duration * 20));
-          marker.style.width = width + 'px';
-          
-          if (width > 35) {
-            marker.textContent = `${s.duration.toFixed(1)}s`;
-          }
-          
-          marker.addEventListener('click', () => {
-            UIController.toggleSilenceQueue(s, marker);
+    groups.forEach((group, groupIdx) => {
+      // ── Kart ──────────────────────────────────────────────
+      const card = document.createElement('div');
+      card.className = 'subtitle-card';
+      card.dataset.groupIdx = groupIdx;
+
+      // Başlık: zaman + karakter sayacı
+      const header = document.createElement('div');
+      header.className = 'subtitle-card-header';
+
+      const timeEl = document.createElement('span');
+      timeEl.className = 'subtitle-card-time';
+      timeEl.textContent = _fmt(group[0].start);
+
+      const charCount = group.map(w => w.word).join(' ').length;
+      const charEl = document.createElement('span');
+      charEl.className = 'subtitle-card-chars' + (charCount > 42 ? ' over-limit' : '');
+      charEl.textContent = charCount + ' kar';
+
+      header.appendChild(timeEl);
+      header.appendChild(charEl);
+      card.appendChild(header);
+
+      // Gövde: kelime span'ları + sessizlik bantları
+      const body = document.createElement('div');
+      body.className = 'subtitle-card-body';
+
+      group.forEach((w, idx) => {
+        if (idx > 0) {
+          const prevW = group[idx - 1];
+          const midSilences = silences.filter(
+            s => s.start >= prevW.end - 0.05 && s.end <= w.start + 0.05
+          );
+          midSilences.forEach(s => {
+            const marker = document.createElement('span');
+            marker.className = 'silence-band';
+            if (UIController.isSilenceQueued(s)) marker.classList.add('queued');
+            marker.dataset.start = s.start;
+            marker.dataset.end   = s.end;
+            marker.title = `${s.duration.toFixed(2)}s sessizlik — Tıkla ekle/kaldır`;
+            const w = Math.min(80, Math.max(12, s.duration * 20));
+            marker.style.width = w + 'px';
+            if (w > 35) marker.textContent = s.duration.toFixed(1) + 's';
+            marker.addEventListener('click', () => UIController.toggleSilenceQueue(s, marker));
+            body.appendChild(marker);
           });
-          fragment.appendChild(marker);
-        });
-      }
+        }
 
-      const span = document.createElement('span');
-      span.className     = 'word';
-      span.dataset.id    = w.id;
-      span.dataset.start = w.start;
-      span.dataset.end   = w.end;
-      span.textContent   = w.word;
+        const span = document.createElement('span');
+        span.className     = 'word';
+        span.dataset.id    = w.id;
+        span.dataset.start = w.start;
+        span.dataset.end   = w.end;
+        span.textContent   = w.word;
 
-      if (w.filler)  span.classList.add('filler');
-      if (w.repeat)  span.classList.add('repeat');
-      if (w.virtual) span.title = 'Interpolasyon ile eklendi';
+        if (w.filler)  span.classList.add('filler');
+        if (w.repeat)  span.classList.add('repeat');
+        if (w.virtual) span.title = 'Interpolasyon ile eklendi';
 
-      span.addEventListener('click',       _onWordClick);
-      span.addEventListener('dblclick',    _onWordDblClick);
-      span.addEventListener('contextmenu', _onWordContextMenu);
-      fragment.appendChild(span);
+        span.addEventListener('click',       _onWordClick);
+        span.addEventListener('dblclick',    _onWordDblClick);
+        span.addEventListener('contextmenu', _onWordContextMenu);
+        body.appendChild(span);
+      });
 
-      if (segmentBreaks.has(w.id)) {
-        const br = document.createElement('span');
-        br.className       = 'segment-break';
-        br.dataset.afterId = w.id;
-        br.dataset.time    = _fmt(w.end);
-        br.title           = 'Segment sonu — tıkla: kaldır';
-        br.addEventListener('click', () => TranscriptStore.removeSegmentBreak(w.id));
-        fragment.appendChild(br);
+      card.appendChild(body);
+      fragment.appendChild(card);
+
+      // Kartlar arası birleştirme çizgisi
+      if (groupIdx < groups.length - 1) {
+        const lastWord = group[group.length - 1];
+        const mergeLine = document.createElement('div');
+        mergeLine.className = 'card-merge-line';
+        const mergeBtn = document.createElement('button');
+        mergeBtn.className = 'card-merge-btn';
+        mergeBtn.textContent = 'Birleştir';
+        mergeBtn.addEventListener('click', () => TranscriptStore.removeSegmentBreak(lastWord.id));
+        mergeLine.appendChild(mergeBtn);
+        fragment.appendChild(mergeLine);
       }
     });
 
+    _container.innerHTML = '';
     _container.appendChild(fragment);
     _updatePlayingWord();
     UIController.updateStats();
@@ -851,13 +948,24 @@ const TranscriptEditor = (() => {
 
   function _updatePlayingWord(time) {
     if (time !== undefined) _currentTime = time;
-    const words = _container?.querySelectorAll('.word');
-    if (!words) return;
-    words.forEach(span => {
+    if (!_container) return;
+
+    let activeCard = null;
+
+    _container.querySelectorAll('.word').forEach(span => {
       const s = parseFloat(span.dataset.start);
       const e = parseFloat(span.dataset.end);
-      span.classList.toggle('playing', _currentTime >= s && _currentTime < e);
+      const isPlaying = _currentTime >= s && _currentTime < e;
+      span.classList.toggle('playing', isPlaying);
+      if (isPlaying) activeCard = span.closest('.subtitle-card');
     });
+
+    _container.querySelectorAll('.subtitle-card').forEach(c => c.classList.remove('active-card'));
+
+    if (activeCard) {
+      activeCard.classList.add('active-card');
+      activeCard.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
   }
 
   function _goToTime(sec) {
@@ -973,34 +1081,89 @@ const SilenceRemover = (() => {
     });
   }
 
+  function _norm(word) {
+    return (word || '').toLowerCase().replace(/[^\wğüşıöçĞÜŞİÖÇ]/g, '').trim();
+  }
+
   /**
-   * Tekrarları tespit et — exact ve fuzzy mod.
-   * @param {string} method 'exact' | 'fuzzy'
+   * Tekrarları tespit et.
+   * @param {string} method 'autocut' | 'exact' | 'fuzzy'
+   * @returns {Array} repeatGroups [{phrase, count, startTime, wordIds}]
    */
   function findRepeats(method) {
-    const words   = TranscriptStore.getWords();
-    const repeats = [];
-
-    // Önce tüm repeat işaretlerini sıfırla
+    const words = TranscriptStore.getWords();
     words.forEach(w => TranscriptStore.markRepeat(w.id, false));
 
-    for (let i = 0; i < words.length - 1; i++) {
-      const a = words[i].word.toLowerCase().trim();
-      const b = words[i + 1].word.toLowerCase().trim();
+    if (method === 'exact' || method === 'fuzzy') {
+      const repeats = [];
+      for (let i = 0; i < words.length - 1; i++) {
+        const a = _norm(words[i].word);
+        const b = _norm(words[i + 1].word);
+        const isRepeat = method === 'fuzzy'
+          ? (a.length > 1 && b.length > 1 && _levenshtein(a, b) <= 2)
+          : (a === b && a.length > 1);
+        if (isRepeat) {
+          TranscriptStore.markRepeat(words[i].id, true);
+          repeats.push({ phrase: words[i].word, count: 2, startTime: words[i].start, wordIds: [words[i].id] });
+        }
+      }
+      return repeats;
+    }
 
-      let isRepeat = false;
-      if (method === 'fuzzy') {
-        isRepeat = a.length > 1 && b.length > 1 && _levenshtein(a, b) <= 2;
-      } else {
-        isRepeat = a === b && a.length > 1;
+    // AutoCut kayan-pencere algoritması
+    const n          = words.length;
+    const normalized = words.map(w => _norm(w.word));
+    const repeatGroups = [];
+    let i = 0;
+
+    // Toplu silme için tek undo snapshot
+    TranscriptStore.pushUndo(words.map(w => w.id));
+
+    while (i < n) {
+      let bestScore = -1, bestU = 0, bestL = 0;
+
+      for (let u = 1; u <= Math.min(10, Math.floor((n - i) / 2)); u++) {
+        let l = 1, j = i + u;
+        while (j + u <= n) {
+          let ok = true;
+          for (let k = 0; k < u; k++) {
+            if (normalized[i + k] !== normalized[j + k]) { ok = false; break; }
+          }
+          if (ok) { l++; j += u; } else break;
+        }
+        const score = u * (l - 1) - 2;
+        if (score >= 0 && l > 1 && score > bestScore) {
+          bestScore = score; bestU = u; bestL = l;
+        }
       }
 
-      if (isRepeat) {
-        TranscriptStore.markRepeat(words[i].id, true);
-        repeats.push({ wordId: words[i].id, word: words[i].word });
+      if (bestScore >= 0) {
+        const phrase = words.slice(i, i + bestU).map(w => w.word).join(' ');
+        const group  = { phrase, count: bestL, startTime: words[i].start, wordIds: [] };
+
+        // Son kopya hariç önceki tüm kopyaları sil + repeat işaretle
+        for (let copy = 0; copy < bestL - 1; copy++) {
+          for (let k = 0; k < bestU; k++) {
+            const w = words[i + copy * bestU + k];
+            w.deleted = true;
+            w.repeat  = true;
+            group.wordIds.push(w.id);
+          }
+        }
+        // Son (doğru) kopyanın kelimelerini de repeat olarak işaretle ama silme
+        for (let k = 0; k < bestU; k++) {
+          const w = words[i + (bestL - 1) * bestU + k];
+          TranscriptStore.markRepeat(w.id, true);
+        }
+
+        repeatGroups.push(group);
+        i += bestU * bestL;
+      } else {
+        i++;
       }
     }
-    return repeats;
+
+    return repeatGroups;
   }
 
   /** Levenshtein mesafesi (fuzzy matching için) */
@@ -1084,24 +1247,208 @@ const SilenceRemover = (() => {
 
 
 /* ══════════════════════════════════════════════════════════════════
+   E-AI. AIEditorEngine  –  Yapay Zeka Transkript Temizleyici
+   ══════════════════════════════════════════════════════════════════ */
+const AIEditorEngine = (() => {
+  const _STORAGE_KEY = 'rfai_ai_editor';
+  let _reasons = [];
+
+  function _loadSettings() {
+    try { return JSON.parse(localStorage.getItem(_STORAGE_KEY) || '{}'); } catch (e) { return {}; }
+  }
+  function _saveSettings(obj) {
+    try { localStorage.setItem(_STORAGE_KEY, JSON.stringify(obj)); } catch (e) {}
+  }
+
+  function initUI() {
+    const saved = _loadSettings();
+    const keyEl   = document.getElementById('aiApiKey');
+    const modelEl = document.getElementById('aiModelSelect');
+    if (keyEl   && saved.apiKey) keyEl.value   = saved.apiKey;
+    if (modelEl && saved.model)  modelEl.value = saved.model;
+
+    const toggle = document.getElementById('aiKeyToggle');
+    if (toggle && keyEl) {
+      toggle.addEventListener('click', () => {
+        keyEl.type = keyEl.type === 'password' ? 'text' : 'password';
+        toggle.textContent = keyEl.type === 'password' ? '👁' : '🙈';
+      });
+    }
+    if (keyEl)   keyEl.addEventListener('change',   () => _saveSettings({ ..._loadSettings(), apiKey: keyEl.value.trim() }));
+    if (modelEl) modelEl.addEventListener('change', () => _saveSettings({ ..._loadSettings(), model: modelEl.value }));
+  }
+
+  const SYSTEM_PROMPT = `Sen bir video transkript editörüsün. Verilen kelime listesindeki kekelemeleri (stutters), dolgu seslerini (ıı, şey, ee, hm vb.), aynı cümlenin birden fazla kez denendiği hatalı çekimleri (multi-takes) ve gereksiz tekrarları tespit et.
+En akıcı ve doğal anlatımı koruyacak şekilde SİLİNMESİ GEREKEN kelimelerin ID'lerini belirle.
+SADECE şu JSON formatında yanıt ver, başka hiçbir şey yazma:
+{"deleted_word_ids":[<id sayıları>],"reasons":[{"id":<id>,"text":"<sebep>"}]}`;
+
+  async function cleanTranscriptWithAI(onStatus) {
+    const settings = _loadSettings();
+    const apiKey   = settings.apiKey || '';
+    const model    = settings.model  || 'gpt-4o-mini';
+
+    if (!apiKey) throw new Error('AI API Key girilmemiş. AI Editör sekmesinden anahtarı girin.');
+
+    const activeWords = TranscriptStore.getWords().map(w => ({ id: w.id, word: w.word }));
+    if (!activeWords.length) throw new Error('Transkript boş.');
+
+    onStatus && onStatus('API\'ye istek gönderiliyor…');
+
+    const userContent = 'Transkript kelimeleri (JSON):\n' + JSON.stringify(activeWords);
+    const isAnthropic = model.startsWith('claude');
+
+    let responseText;
+
+    if (typeof require === 'function') {
+      responseText = await _callApiNode(apiKey, model, isAnthropic, userContent, onStatus);
+    } else {
+      responseText = await _callApiFetch(apiKey, model, isAnthropic, userContent, onStatus);
+    }
+
+    let parsed;
+    try {
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(jsonMatch ? jsonMatch[0] : responseText);
+    } catch (e) {
+      throw new Error('AI yanıtı JSON olarak çözümlenemedi: ' + responseText.slice(0, 200));
+    }
+
+    const deletedIds = parsed.deleted_word_ids || [];
+    _reasons = parsed.reasons || [];
+
+    TranscriptStore.pushUndo(deletedIds);
+    deletedIds.forEach(id => {
+      const w = TranscriptStore.getWords(true).find(x => x.id === id);
+      if (w) { w.deleted = true; w.aiDeleted = true; }
+    });
+
+    TranscriptStore.notifyAll();
+    _applyAiDeletedClass(deletedIds);
+
+    return { deletedCount: deletedIds.length, reasons: _reasons };
+  }
+
+  function _applyAiDeletedClass(deletedIds) {
+    const idSet = new Set(deletedIds.map(String));
+    document.querySelectorAll('.word').forEach(span => {
+      if (idSet.has(span.dataset.id)) {
+        span.classList.add('ai-deleted');
+        const reason = _reasons.find(r => String(r.id) === span.dataset.id);
+        if (reason) span.dataset.aiReason = reason.text;
+      }
+    });
+  }
+
+  async function _callApiNode(apiKey, model, isAnthropic, userContent, onStatus) {
+    return new Promise((resolve, reject) => {
+      const https = require('https');
+      const body  = Buffer.from(JSON.stringify(
+        isAnthropic
+          ? { model, max_tokens: 4096, system: SYSTEM_PROMPT, messages: [{ role: 'user', content: userContent }] }
+          : { model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent }], response_format: { type: 'json_object' } }
+      ));
+
+      const opts = {
+        hostname: isAnthropic ? 'api.anthropic.com' : 'api.openai.com',
+        path    : isAnthropic ? '/v1/messages' : '/v1/chat/completions',
+        method  : 'POST',
+        headers : {
+          'Content-Type': 'application/json',
+          'Content-Length': body.length,
+          ...(isAnthropic
+            ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
+            : { 'Authorization': 'Bearer ' + apiKey })
+        }
+      };
+
+      const req = https.request(opts, res => {
+        let raw = '';
+        res.on('data', c => raw += c);
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(raw);
+            if (data.error) { reject(new Error('AI API: ' + (data.error.message || JSON.stringify(data.error)))); return; }
+            const text = isAnthropic
+              ? (data.content && data.content[0] && data.content[0].text)
+              : (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content);
+            resolve(text || '');
+          } catch (e) { reject(new Error('API yanıtı çözümlenemedi: ' + raw.slice(0, 200))); }
+        });
+      });
+      req.on('error', e => reject(new Error('HTTPS hatası: ' + e.message)));
+      req.write(body);
+      req.end();
+    });
+  }
+
+  async function _callApiFetch(apiKey, model, isAnthropic, userContent, onStatus) {
+    const url  = isAnthropic ? 'https://api.anthropic.com/v1/messages' : 'https://api.openai.com/v1/chat/completions';
+    const body = isAnthropic
+      ? { model, max_tokens: 4096, system: SYSTEM_PROMPT, messages: [{ role: 'user', content: userContent }] }
+      : { model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent }], response_format: { type: 'json_object' } };
+
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(isAnthropic
+        ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
+        : { 'Authorization': 'Bearer ' + apiKey })
+    };
+
+    const res  = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (data.error) throw new Error('AI API: ' + (data.error.message || JSON.stringify(data.error)));
+    return isAnthropic
+      ? (data.content && data.content[0] && data.content[0].text)
+      : (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content);
+  }
+
+  function getReasons() { return _reasons; }
+
+  return { initUI, cleanTranscriptWithAI, getReasons };
+})();
+
+
+/* ══════════════════════════════════════════════════════════════════
    E. SubtitleEngine  –  SRT Altyazı Üretimi
    ══════════════════════════════════════════════════════════════════ */
 const SubtitleEngine = (() => {
+  const _STORAGE_KEY = 'rfai_subtitle_style_v2';
+
   let _style = {
-    fontFamily    : 'Arial',
-    fontSize      : 48,
-    color         : '#FFFFFF',
-    strokeWidth   : 2,
-    strokeColor   : '#000000',
-    shadowEnabled : true,
-    highlightColor: '#FF6B3D',
-    positionX     : 50,
-    positionY     : 85,
-    alignment     : 'center'
+    fontFamily       : 'Arial',
+    fontSize         : 48,
+    color            : '#FFFFFF',
+    strokeWidth      : 2,
+    strokeColor      : '#000000',
+    shadowEnabled    : true,
+    highlightColor   : '#FF6B3D',
+    positionX        : 50,
+    positionY        : 85,
+    alignment        : 'center',
+    subtitleStyle    : 'corporate',
+    bgBoxEnabled     : false,
+    bgBoxColor       : '#000000',
+    bgBoxOpacity     : 75,
+    passiveColor     : '#AAAAAA',
+    allCaps          : false
   };
 
+  function _loadFromStorage() {
+    try {
+      const saved = localStorage.getItem(_STORAGE_KEY);
+      if (saved) Object.assign(_style, JSON.parse(saved));
+    } catch (e) {}
+  }
+
+  function _saveToStorage() {
+    try { localStorage.setItem(_STORAGE_KEY, JSON.stringify(_style)); } catch (e) {}
+  }
+
+  _loadFromStorage();
+
   function getStyle()        { return { ..._style }; }
-  function setStyle(updates) { Object.assign(_style, updates); _updatePreview(); }
+  function setStyle(updates) { Object.assign(_style, updates); _saveToStorage(); _updatePreview(); }
 
   function _getAlignmentTag(align, x, y) {
     let tag = 2; // Bottom-Center
@@ -1152,7 +1499,7 @@ const SubtitleEngine = (() => {
     const alignTag = _getAlignmentTag(_style.alignment, _style.positionX, _style.positionY);
 
     const segments = segmented.map(wordArr => ({
-      text : alignTag + wordArr.map(w => w.word).join(' '),
+      text : alignTag + wordArr.map(w => _style.allCaps ? w.word.toUpperCase() : w.word).join(' '),
       start: wordArr[0].start,
       end  : wordArr[wordArr.length - 1].end,
       words: wordArr.map(w => ({ word: w.word, start: w.start, end: w.end }))
@@ -1206,7 +1553,120 @@ const SubtitleEngine = (() => {
     return `${p2(h)}:${p2(m)}:${p2(s)},${p3(ms)}`;
   }
 
-  return { getStyle, setStyle, generateSubtitles };
+  /**
+   * Timeline'a Essential Graphics klipleri olarak enjekte et.
+   * Kurumsal mod: grup başına sabit altyazı.
+   * Dinamik mod: kelime başına klip + pop-in keyframe.
+   */
+  async function injectToTimeline() {
+    const segmented = TranscriptStore.getSegmentedWords();
+    if (segmented.length === 0) throw new Error('Transkript boş. Önce transkript oluşturun.');
+
+    const mode = _style.subtitleStyle || 'corporate';
+    let segments;
+
+    if (mode === 'dynamic') {
+      // Her kelime ayrı bir klip
+      segments = [];
+      segmented.forEach(group => {
+        group.forEach(w => {
+          segments.push({
+            text : _style.allCaps ? w.word.toUpperCase() : w.word,
+            start: w.start,
+            end  : w.end,
+            words: [{ word: w.word, start: w.start, end: w.end }]
+          });
+        });
+      });
+    } else {
+      // Kurumsal: her grubu maks. 8 kelimelik satırlara böl
+      const alignTag = _getAlignmentTag(_style.alignment, _style.positionX, _style.positionY);
+      segments = [];
+      segmented.forEach(group => {
+        for (let i = 0; i < group.length; i += 8) {
+          const slice = group.slice(i, i + 8);
+          const text  = slice.map(w => _style.allCaps ? w.word.toUpperCase() : w.word).join(' ');
+          segments.push({
+            text : alignTag + text,
+            start: slice[0].start,
+            end  : slice[slice.length - 1].end,
+            words: slice.map(w => ({ word: w.word, start: w.start, end: w.end }))
+          });
+        }
+      });
+    }
+
+    const styleParams = {
+      fontName           : _style.fontFamily,
+      fontSize           : _style.fontSize,
+      textColor          : _style.color,
+      alignment          : _style.alignment,
+      trackIndex         : 1,
+      backgroundEnabled  : _style.bgBoxEnabled,
+      backgroundColor    : _style.bgBoxColor,
+      backgroundOpacity  : _style.bgBoxOpacity,
+      mode               : mode
+    };
+
+    return new Promise((resolve, reject) => {
+      const cs = window.getCSInterface ? window.getCSInterface() : null;
+      const script = `createSubtitleGraphicClips(${JSON.stringify(JSON.stringify(segments))}, ${JSON.stringify(JSON.stringify(styleParams))})`;
+      if (cs) {
+        cs.evalScript(script, result => {
+          try { resolve(JSON.parse(result)); }
+          catch (e) { reject(new Error('ExtendScript yanıtı işlenemedi: ' + e.message)); }
+        });
+      } else {
+        reject(new Error('Premiere Pro bağlantısı yok.'));
+      }
+    });
+  }
+
+  /**
+   * Transkripti otomatik segment break'lere böler.
+   * @param {number} maxChars        Satır başına maks karakter (varsayılan 35)
+   * @param {number} maxDuration     Segment maks. süresi saniye (varsayılan 3.0)
+   * @param {number} silenceThreshold Sessizlik eşiği saniye (varsayılan 0.5)
+   */
+  function autoSegmentSubtitles(maxChars, maxDuration, silenceThreshold) {
+    maxChars         = maxChars         || 35;
+    maxDuration      = maxDuration      || 3.0;
+    silenceThreshold = silenceThreshold || 0.5;
+
+    const words = TranscriptStore.getWords();
+    if (!words.length) return 0;
+
+    // Önce mevcut segment break'leri temizle
+    TranscriptStore.getSegments().forEach(s => TranscriptStore.removeSegmentBreak(s.afterWordId));
+
+    const PUNCT_RE = /[.!?,\-—;:]/;
+    let breakCount = 0;
+    let segStart   = 0;
+
+    for (let i = 0; i < words.length - 1; i++) {
+      const w       = words[i];
+      const next    = words[i + 1];
+      const segText = words.slice(segStart, i + 1).map(x => x.word).join(' ');
+      const chars   = segText.length;
+      const dur     = w.end - words[segStart].start;
+      const gap     = next.start - w.end;
+
+      const hasPunct    = PUNCT_RE.test(w.word);
+      const overChars   = chars >= maxChars;
+      const overDur     = dur  >= maxDuration;
+      const bigSilence  = gap  >= silenceThreshold;
+
+      if (overChars || overDur || (hasPunct && (chars > 12 || bigSilence)) || bigSilence) {
+        TranscriptStore.addSegmentBreak(w.id);
+        segStart = i + 1;
+        breakCount++;
+      }
+    }
+
+    return breakCount;
+  }
+
+  return { getStyle, setStyle, generateSubtitles, injectToTimeline, autoSegmentSubtitles };
 })();
 
 
@@ -1320,6 +1780,23 @@ const UIController = (() => {
     const genSubBtn = document.getElementById('generateSubtitlesBtn');
     if (genSubBtn) genSubBtn.addEventListener('click', _onGenerateSubtitles);
 
+    // Timeline enjeksiyon
+    const injectBtn = document.getElementById('injectTimelineBtn');
+    if (injectBtn) injectBtn.addEventListener('click', _onInjectTimeline);
+
+    // AI Editor
+    AIEditorEngine.initUI();
+    const aiCleanBtn = document.getElementById('runAiCleanBtn');
+    if (aiCleanBtn) aiCleanBtn.addEventListener('click', _onRunAiClean);
+
+    // Otomatik segment bölme
+    const autoSegBtn = document.getElementById('autoSegmentBtn');
+    if (autoSegBtn) autoSegBtn.addEventListener('click', () => {
+      const n = SubtitleEngine.autoSegmentSubtitles();
+      toast(n > 0 ? `${n} segment break oluşturuldu.` : 'Segment break oluşturulamadı (önce transkript oluşturun).', n > 0 ? 'success' : 'warn');
+      log('Otomatik bölme: ' + n + ' segment.', 'info');
+    });
+
     // Stil kontrolleri
     _initStyleControls();
     _renderFillerChips();
@@ -1346,6 +1823,19 @@ const UIController = (() => {
         });
       }
     }, 500);
+
+    // Alt+Z Geri Alma (Premiere'in Ctrl+Z ile çakışmaz)
+    document.addEventListener('keydown', (e) => {
+      if (e.altKey && (e.key === 'z' || e.key === 'Z')) {
+        e.preventDefault();
+        if (TranscriptStore.undo()) {
+          toast('Geri alındı (Alt+Z)', 'info');
+          log('Undo uygulandı.', 'info');
+        } else {
+          toast('Geri alınacak işlem yok.', 'warn');
+        }
+      }
+    });
 
     TranscriptEditor.init('transcriptArea');
     updateStats();
@@ -1517,12 +2007,58 @@ const UIController = (() => {
   }
 
   function _onScanRepeats() {
-    const method  = document.getElementById('repeatMethod')?.value || 'exact';
-    const repeats = SilenceRemover.findRepeats(method);
+    const method = document.getElementById('repeatMethod')?.value || 'autocut';
+    const groups = SilenceRemover.findRepeats(method);
     TranscriptStore.notifyAll();
-    if (repeats.length) {
-      toast(`${repeats.length} tekrar tespit edildi. Kırmızıyla işaretlendi.`, 'warn');
-      log(repeats.length + ' tekrar bulundu (' + method + ' mod).', 'warn');
+
+    const listEl = document.getElementById('repeatList');
+    if (listEl) {
+      listEl.innerHTML = '';
+      if (groups.length === 0) {
+        listEl.innerHTML = '<div style="font-size:11px;color:var(--text-2);padding:6px 0;">Tekrar bulunamadı.</div>';
+      } else {
+        groups.forEach(group => {
+          const card = document.createElement('div');
+          card.className = 'repeat-card';
+
+          const info = document.createElement('div');
+          info.className = 'repeat-card-info';
+          info.innerHTML = `<div class="repeat-card-phrase">"${group.phrase}"</div>
+            <div class="repeat-card-meta">${group.count}x tekrar &middot; ${_fmt(group.startTime)}</div>`;
+
+          const actions = document.createElement('div');
+          actions.className = 'repeat-card-actions';
+
+          const listenBtn = document.createElement('button');
+          listenBtn.className = 'btn btn-secondary btn-sm';
+          listenBtn.textContent = '▶ Dinle';
+          listenBtn.addEventListener('click', () => {
+            const cs = window.getCSInterface ? window.getCSInterface() : null;
+            if (cs) cs.evalScript('goToTime(' + group.startTime + ')', () => {});
+          });
+
+          const keepBtn = document.createElement('button');
+          keepBtn.className = 'btn btn-secondary btn-sm';
+          keepBtn.textContent = 'Koru';
+          keepBtn.addEventListener('click', () => {
+            group.wordIds.forEach(id => TranscriptStore.restoreWord(id));
+            TranscriptStore.notifyAll();
+            toast('Kelimeler korundu.', 'info');
+            card.remove();
+          });
+
+          actions.appendChild(listenBtn);
+          actions.appendChild(keepBtn);
+          card.appendChild(info);
+          card.appendChild(actions);
+          listEl.appendChild(card);
+        });
+      }
+    }
+
+    if (groups.length) {
+      toast(`${groups.length} tekrar grubu tespit edildi.`, 'warn');
+      log(groups.length + ' tekrar grubu bulundu (' + method + ' mod).', 'warn');
     } else {
       toast('Tekrar bulunamadı.', 'info');
     }
@@ -1564,6 +2100,95 @@ const UIController = (() => {
         log('Hata: ' + result.error, 'error');
       }
 
+    } catch (e) {
+      toast('Hata: ' + e.message, 'error');
+      log('Hata: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      _showLoading(false);
+    }
+  }
+
+  async function _onRunAiClean() {
+    const btn = document.getElementById('runAiCleanBtn');
+    const statusBar = document.getElementById('aiStatusBar');
+    btn.disabled = true;
+    _showLoading(true);
+
+    const setStatus = msg => { if (statusBar) statusBar.textContent = msg; };
+    setStatus('Hazırlanıyor…');
+
+    try {
+      const { deletedCount, reasons } = await AIEditorEngine.cleanTranscriptWithAI(setStatus);
+
+      setStatus(`${deletedCount} kelime AI tarafından silindi.`);
+
+      const statsEl = document.getElementById('aiStats');
+      const delCntEl = document.getElementById('aiDeletedCount');
+      const reasCntEl = document.getElementById('aiReasonCount');
+      if (statsEl)  { statsEl.style.display = 'flex'; }
+      if (delCntEl)  delCntEl.textContent  = deletedCount;
+      if (reasCntEl) reasCntEl.textContent = reasons.length;
+
+      // Sebep listesini doldur
+      const listEl = document.getElementById('aiReasonsList');
+      const section = document.getElementById('aiReasonsSection');
+      if (listEl && reasons.length > 0) {
+        listEl.innerHTML = '';
+        if (section) section.style.display = 'block';
+        reasons.forEach(r => {
+          const item = document.createElement('div');
+          item.className = 'ai-reason-item';
+
+          const wordEl = TranscriptStore.getWords(true).find(w => w.id === r.id);
+          const wordText = wordEl ? wordEl.word : '(?)';
+
+          item.innerHTML = `
+            <div class="ai-reason-word">"${wordText}"</div>
+            <div class="ai-reason-text">${r.text}</div>
+            <button class="ai-reason-restore" data-id="${r.id}">Koru</button>`;
+
+          item.querySelector('.ai-reason-restore').addEventListener('click', (e) => {
+            const id = String(e.currentTarget.dataset.id);
+            TranscriptStore.restoreWord(id);
+            document.querySelectorAll(`.word[data-id="${id}"]`).forEach(s => {
+              s.classList.remove('ai-deleted');
+              delete s.dataset.aiReason;
+            });
+            item.remove();
+            setStatus('Kelime korundu.');
+          });
+
+          listEl.appendChild(item);
+        });
+      }
+
+      toast(`AI: ${deletedCount} kelime temizlendi.`, 'success');
+      log('AI temizleme tamamlandı: ' + deletedCount + ' kelime.', 'success');
+
+    } catch (e) {
+      setStatus('Hata: ' + e.message);
+      toast('AI Hata: ' + e.message, 'error');
+      log('AI Hata: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      _showLoading(false);
+    }
+  }
+
+  async function _onInjectTimeline() {
+    const btn = document.getElementById('injectTimelineBtn');
+    btn.disabled = true;
+    _showLoading(true);
+    try {
+      const result = await SubtitleEngine.injectToTimeline();
+      if (result.success) {
+        toast(`${result.createdCount} Essential Graphics klibi oluşturuldu ✓`, 'success');
+        log('Timeline enjeksiyonu tamamlandı: ' + result.createdCount + ' klip.', 'success');
+      } else {
+        toast('Enjeksiyon hatası: ' + result.error, 'error');
+        log('Hata: ' + result.error, 'error');
+      }
     } catch (e) {
       toast('Hata: ' + e.message, 'error');
       log('Hata: ' + e.message, 'error');
@@ -1615,12 +2240,19 @@ const UIController = (() => {
       strokeColor   : 'strokeColorInput',
       highlightColor: 'highlightColorInput',
       positionX     : 'positionXInput',
-      positionY     : 'positionYInput'
+      positionY     : 'positionYInput',
+      subtitleStyle : 'subtitleStyleSelect',
+      bgBoxColor    : 'bgBoxColor',
+      bgBoxOpacity  : 'bgOpacityInput',
+      passiveColor  : 'passiveColorInput'
     };
 
+    // Restore saved values
+    const saved = SubtitleEngine.getStyle();
     Object.entries(controls).forEach(([key, id]) => {
       const el = document.getElementById(id);
       if (!el) return;
+      if (saved[key] !== undefined) el.value = saved[key];
       el.addEventListener('input', () => {
         const update = {};
         update[key] = el.type === 'number' || el.type === 'range'
@@ -1628,6 +2260,33 @@ const UIController = (() => {
         SubtitleEngine.setStyle(update);
       });
     });
+
+    // bgBoxToggle
+    const bgBoxToggle = document.getElementById('bgBoxToggle');
+    const bgBoxSettings = document.getElementById('bgBoxSettings');
+    if (bgBoxToggle) {
+      bgBoxToggle.checked = saved.bgBoxEnabled || false;
+      if (bgBoxSettings) bgBoxSettings.classList.toggle('visible', bgBoxToggle.checked);
+      bgBoxToggle.addEventListener('change', () => {
+        SubtitleEngine.setStyle({ bgBoxEnabled: bgBoxToggle.checked });
+        if (bgBoxSettings) bgBoxSettings.classList.toggle('visible', bgBoxToggle.checked);
+      });
+    }
+
+    // allCapsToggle
+    const allCapsToggle = document.getElementById('allCapsToggle');
+    if (allCapsToggle) {
+      allCapsToggle.checked = saved.allCaps || false;
+      allCapsToggle.addEventListener('change', () => {
+        SubtitleEngine.setStyle({ allCaps: allCapsToggle.checked });
+      });
+    }
+
+    // Restore bgOpacity label
+    const bgOpacityLabel = document.getElementById('bgOpacityLabel');
+    if (bgOpacityLabel && saved.bgBoxOpacity !== undefined) {
+      bgOpacityLabel.textContent = saved.bgBoxOpacity;
+    }
 
     document.querySelectorAll('.color-option').forEach(sw => {
       sw.addEventListener('click', () => {

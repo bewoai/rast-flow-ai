@@ -214,10 +214,13 @@ function getSequenceInfo() {
 
 function rippleDeleteRanges(rangesJSON, ripple) {
   try {
+    app.userInputDisabled = true;
+
     var ranges = JSON.parse(rangesJSON);
     var doRipple = (ripple === undefined || ripple === "true" || ripple === true);
 
     if (!ranges || ranges.length === 0) {
+      app.userInputDisabled = false;
       return JSON.stringify({ success: true, deletedCount: 0 });
     }
 
@@ -259,9 +262,11 @@ function rippleDeleteRanges(rangesJSON, ripple) {
       deletedCount += _rippleRemoveMiddle(qeSeq, inSec, outSec, doRipple);
     }
 
+    app.userInputDisabled = false;
     return JSON.stringify({ success: true, deletedCount: deletedCount });
 
   } catch (e) {
+    try { app.userInputDisabled = false; } catch (e2) {}
     return JSON.stringify({ success: false, error: e.message });
   }
 }
@@ -419,7 +424,117 @@ function _secsToSRTTime(secs) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
-   6. addKeyframesToLayer() — Genel Keyframe API
+   6. createSubtitleGraphicClips() — Essential Graphics Enjeksiyon Motoru
+   ══════════════════════════════════════════════════════════════════ */
+
+function createSubtitleGraphicClips(segmentsJSON, styleParamsJSON) {
+  try {
+    app.userInputDisabled = true;
+
+    var segments    = JSON.parse(segmentsJSON);
+    var styleParams = JSON.parse(styleParamsJSON);
+
+    if (!segments || segments.length === 0) {
+      app.userInputDisabled = false;
+      return JSON.stringify({ success: false, error: "Segment verisi boş." });
+    }
+
+    var seq = app.project.activeSequence;
+    if (!seq) {
+      app.userInputDisabled = false;
+      return JSON.stringify({ success: false, error: "Aktif sekans bulunamadı." });
+    }
+
+    var trackIndex  = (styleParams.trackIndex !== undefined) ? styleParams.trackIndex : 1;
+    var videoTrack  = seq.videoTracks[trackIndex];
+    if (!videoTrack) {
+      app.userInputDisabled = false;
+      return JSON.stringify({ success: false, error: "Video track " + trackIndex + " bulunamadı." });
+    }
+
+    var ticksPerSec  = 254016000000;
+    var createdCount = 0;
+
+    for (var i = 0; i < segments.length; i++) {
+      var seg        = segments[i];
+      var startSec   = parseFloat(seg.start);
+      var endSec     = parseFloat(seg.end);
+      var startTicks = Math.round(startSec * ticksPerSec);
+      var durTicks   = Math.round((endSec - startSec) * ticksPerSec);
+
+      if (durTicks <= 0) continue;
+
+      try {
+        var startTime = new Time();
+        startTime.ticks = String(startTicks);
+
+        var graphicClip = videoTrack.createGraphicClip(startTime);
+        if (!graphicClip) continue;
+
+        var endTime = new Time();
+        endTime.ticks = String(startTicks + durTicks);
+        graphicClip.end = endTime;
+
+        // Metin içeriği — mevcut text item varsa güncelle, yoksa ekle
+        try {
+          var comp = graphicClip.getMOGRTComponent
+            ? graphicClip.getMOGRTComponent()
+            : null;
+
+          if (comp && comp.properties && comp.properties.firstObject) {
+            var textProp = comp.properties.firstObject;
+            var textDoc  = textProp.getValue();
+
+            textDoc.font          = styleParams.fontName  || "Arial";
+            textDoc.fontSize      = styleParams.fontSize  || 48;
+            textDoc.fillColor     = _hexToFloatArray(styleParams.textColor || "#FFFFFF");
+            textDoc.justification = (styleParams.alignment === "right") ? 2
+                                  : (styleParams.alignment === "left")  ? 0
+                                  : 1; // center
+
+            if (styleParams.backgroundEnabled) {
+              textDoc.backgroundEnabled = true;
+              textDoc.backgroundColor   = _hexToFloatArray(styleParams.backgroundColor || "#000000");
+              textDoc.backgroundOpacity = (styleParams.backgroundOpacity || 75) / 100;
+            } else {
+              textDoc.backgroundEnabled = false;
+            }
+
+            textProp.setValue(textDoc);
+          }
+        } catch (textErr) { /* TextDocument API mevcut değilse sessizce devam et */ }
+
+        // Dynamic mod: Pop-in ölçek keyframe'leri
+        if (styleParams.mode === "dynamic" && seg.words && seg.words.length > 0) {
+          try {
+            var motionProp = graphicClip.getComponentParam("Motion", "Scale");
+            if (motionProp) {
+              for (var w = 0; w < seg.words.length; w++) {
+                var wrd     = seg.words[w];
+                var wTicks  = Math.round(parseFloat(wrd.start) * ticksPerSec);
+                var wTicks2 = Math.round((parseFloat(wrd.start) + 0.06) * ticksPerSec);
+                motionProp.addKeyframe(wTicks,  100);
+                motionProp.addKeyframe(wTicks2, 115);
+              }
+            }
+          } catch (kfErr) {}
+        }
+
+        createdCount++;
+      } catch (clipErr) {}
+    }
+
+    app.userInputDisabled = false;
+    return JSON.stringify({ success: true, createdCount: createdCount });
+
+  } catch (e) {
+    try { app.userInputDisabled = false; } catch (e2) {}
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   7. addKeyframesToLayer() — Genel Keyframe API
    ══════════════════════════════════════════════════════════════════ */
 
 function addKeyframesToLayer(paramsJSON) {

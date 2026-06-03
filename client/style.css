@@ -628,3 +628,124 @@ input[type=range]::-webkit-slider-thumb {
 .drawer .section { background: var(--bg-2); }
 
 .hint { font-size: 9.5px; color: var(--text-2); line-height: 1.6; margin-top: 6px; }
+
+/* ── AI Deleted word ───────────────────────────────────── */
+.word.ai-deleted {
+  color: var(--text-3);
+  text-decoration: line-through;
+  background: rgba(150,140,130,.1);
+  position: relative;
+  cursor: help;
+}
+.word.ai-deleted::after {
+  content: attr(data-ai-reason);
+  position: absolute; bottom: 100%; left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-2); border: 1px solid var(--border-2);
+  color: var(--yellow); font-size: 9.5px; white-space: nowrap;
+  padding: 3px 8px; border-radius: 6px; pointer-events: none;
+  opacity: 0; transition: opacity .15s; z-index: 100;
+  box-shadow: 0 4px 12px rgba(0,0,0,.4);
+}
+.word.ai-deleted:hover::after { opacity: 1; }
+
+/* ── AI Editor Panel ────────────────────────────────────── */
+.ai-stats {
+  display: flex; gap: 16px; justify-content: center;
+  padding: 8px 0; font-size: 11.5px; color: var(--text-1);
+}
+.ai-reasons-list { display: flex; flex-direction: column; gap: 7px; }
+.ai-reason-item {
+  display: flex; align-items: flex-start; gap: 10px;
+  background: var(--bg-0); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 9px 12px;
+}
+.ai-reason-word {
+  font-weight: 700; color: var(--accent-bright); font-size: 11.5px;
+  flex-shrink: 0; min-width: 70px; word-break: break-all;
+}
+.ai-reason-text { font-size: 10.5px; color: var(--text-1); flex: 1; }
+.ai-reason-restore {
+  flex-shrink: 0; padding: 2px 8px; border-radius: var(--r-pill);
+  background: var(--bg-3); border: 1px solid var(--border);
+  color: var(--text-2); font-size: 9.5px; cursor: pointer;
+  transition: all .15s;
+}
+.ai-reason-restore:hover { background: var(--bg-hover); color: var(--text-0); }
+
+/* ── Subtitle Cards ─────────────────────────────────────── */
+.subtitle-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  margin-bottom: 4px;
+  transition: border-color .2s, box-shadow .2s;
+}
+.subtitle-card.active-card {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft), 0 4px 14px rgba(240,67,30,.12);
+}
+.subtitle-card-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 4px 10px 3px;
+  border-bottom: 1px solid var(--border);
+}
+.subtitle-card-time {
+  font-size: 9.5px; font-family: ui-monospace, monospace;
+  color: var(--text-2); font-weight: 600;
+}
+.subtitle-card-chars {
+  font-size: 9.5px; font-family: ui-monospace, monospace;
+  color: var(--text-2);
+}
+.subtitle-card-chars.over-limit { color: var(--red); font-weight: 700; }
+.subtitle-card-body { padding: 8px 10px; line-height: 2.1; }
+
+/* Silence band (between words in card) */
+.silence-band {
+  display: inline-block; height: 14px; vertical-align: middle;
+  background: var(--accent-soft); border: 1.5px solid rgba(240,67,30,.25);
+  border-radius: 4px; margin: 0 3px; cursor: pointer;
+  transition: background .15s, border-color .15s;
+  font-size: 8.5px; line-height: 14px; text-align: center;
+  color: var(--text-2); font-family: ui-monospace, monospace;
+  min-width: 12px;
+}
+.silence-band:hover { background: var(--accent-soft); border-color: var(--accent); }
+.silence-band.queued { background: rgba(239,83,80,.18); border-color: var(--red); }
+
+/* Card merge/split line */
+.card-merge-line {
+  display: flex; align-items: center; gap: 8px;
+  margin: 2px 0; padding: 0 2px;
+}
+.card-merge-line::before, .card-merge-line::after {
+  content: ''; flex: 1; height: 1px;
+  background: var(--border);
+}
+.card-merge-btn {
+  padding: 2px 9px; border-radius: var(--r-pill);
+  background: var(--bg-3); border: 1px solid var(--border);
+  color: var(--text-2); font-size: 9.5px; font-weight: 600;
+  cursor: pointer; transition: all .15s; white-space: nowrap;
+}
+.card-merge-btn:hover {
+  background: var(--bg-hover); color: var(--text-0);
+  border-color: var(--border-2);
+}
+
+/* Background box toggle settings */
+.bg-box-settings { display: none; margin-top: 8px; }
+.bg-box-settings.visible { display: block; animation: fadeUp .2s var(--spring); }
+
+/* Repeat list cards */
+.repeat-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.repeat-card {
+  background: var(--bg-0); border: 1px solid rgba(255,107,61,.2);
+  border-radius: var(--r); padding: 10px 12px;
+  display: flex; align-items: center; gap: 10px;
+}
+.repeat-card-info { flex: 1; }
+.repeat-card-phrase { font-size: 11.5px; font-weight: 600; color: var(--accent-bright); }
+.repeat-card-meta { font-size: 9.5px; color: var(--text-2); margin-top: 2px; font-family: ui-monospace, monospace; }
+.repeat-card-actions { display: flex; gap: 6px; flex-shrink: 0; }
