@@ -513,7 +513,7 @@ const APIManager = (() => {
     }
   }
 
-  return { setApiKey, getApiKey, hasStoredKey, maskApiKey, transcribe, getLastWavPath, getLastWavOffset, cleanupLastWav, _findFfmpeg };
+  return { setApiKey, getApiKey, hasStoredKey, maskApiKey, transcribe, getLastWavPath, getLastWavOffset, cleanupLastWav, findFfmpeg: _findFfmpeg };
 })();
 
 
