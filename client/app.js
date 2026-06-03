@@ -20,6 +20,8 @@ const APIManager = (() => {
   const MODEL       = 'whisper-1';
 
   let _apiKey = '';
+  let _lastWavPath = '';
+  let _lastWavOffset = 0;
 
   /** Cihaza özgü AES-256 şifreleme anahtarı üret */
   function _getDeviceKey() {
@@ -156,6 +158,10 @@ const APIManager = (() => {
     onProgress && onProgress(15, 'Ses çıkarılıyor…');
     const filePath = await _extractAudio(src.path, src.srcStart, src.duration);
 
+    // Keep active WAV file path for silence detection
+    _lastWavPath = filePath;
+    _lastWavOffset = baseOffset;
+
     const rangeMsg = src.mode === 'inout'
       ? `In/Out aralığı (${baseOffset.toFixed(2)}s – ${src.duration.toFixed(2)}s) Whisper'a gönderiliyor…`
       : 'Tüm sekans Whisper\'a gönderiliyor…';
@@ -171,13 +177,6 @@ const APIManager = (() => {
         w.end   = parseFloat((w.end   + baseOffset).toFixed(3));
       });
     }
-
-    try {
-      if (typeof require === 'function') {
-        const fs = require('fs');
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      }
-    } catch (e) {}
 
     onProgress && onProgress(100, 'Tamamlandı.');
     return words;
@@ -453,7 +452,19 @@ const APIManager = (() => {
 
   function _uid() { return Math.random().toString(36).slice(2, 9); }
 
-  return { setApiKey, getApiKey, hasStoredKey, maskApiKey, transcribe };
+  function getLastWavPath() { return _lastWavPath; }
+  function getLastWavOffset() { return _lastWavOffset; }
+  function cleanupLastWav() {
+    if (_lastWavPath) {
+      try {
+        const fs = require('fs');
+        if (fs.existsSync(_lastWavPath)) fs.unlinkSync(_lastWavPath);
+      } catch (e) {}
+      _lastWavPath = '';
+    }
+  }
+
+  return { setApiKey, getApiKey, hasStoredKey, maskApiKey, transcribe, getLastWavPath, getLastWavOffset, cleanupLastWav, _findFfmpeg };
 })();
 
 
@@ -642,27 +653,39 @@ const TranscriptEditor = (() => {
       return;
     }
 
-    // Aktif sessizlik eşiğini oku (tek kaynak: silenceThreshold2)
-    const silenceThreshold = _getSilenceThreshold();
-    const segmentBreaks    = new Set((segments || []).map(s => s.afterWordId));
-    const fragment         = document.createDocumentFragment();
-    const activeWords      = words.filter(w => !w.deleted);
+    const silences      = SilenceRemover.getDetectedSilences() || [];
+    const segmentBreaks = new Set((segments || []).map(s => s.afterWordId));
+    const fragment      = document.createDocumentFragment();
+    const activeWords   = words.filter(w => !w.deleted);
 
     activeWords.forEach((w, idx) => {
-      // Sessizlik marker'ı
+      // Find silences falling between prevActive and w
       if (idx > 0) {
         const prevActive = activeWords[idx - 1];
-        const gap = w.start - prevActive.end;
-        if (gap >= silenceThreshold) {
+        const midSilences = silences.filter(s => s.start >= prevActive.end - 0.05 && s.end <= w.start + 0.05);
+        midSilences.forEach(s => {
           const marker = document.createElement('span');
-          marker.className      = 'silence-marker will-cut';
-          marker.dataset.start  = prevActive.end;
-          marker.dataset.end    = w.start;
-          marker.dataset.dur    = gap.toFixed(2);
-          marker.title          = `${gap.toFixed(2)}s sessizlik — tıkla: sil listesine ekle`;
-          marker.addEventListener('click', _onSilenceMarkerClick);
+          marker.className = 'silence-band';
+          const isQueued = UIController.isSilenceQueued(s);
+          if (isQueued) marker.classList.add('queued');
+          
+          marker.dataset.start = s.start;
+          marker.dataset.end = s.end;
+          marker.dataset.dur = s.duration;
+          marker.title = `${s.duration.toFixed(2)}s sessizlik — Tıkla: sil listesine ekle/kaldır`;
+          
+          const width = Math.min(80, Math.max(12, s.duration * 20));
+          marker.style.width = width + 'px';
+          
+          if (width > 35) {
+            marker.textContent = `${s.duration.toFixed(1)}s`;
+          }
+          
+          marker.addEventListener('click', () => {
+            UIController.toggleSilenceQueue(s, marker);
+          });
           fragment.appendChild(marker);
-        }
+        });
       }
 
       const span = document.createElement('span');
@@ -849,7 +872,7 @@ const TranscriptEditor = (() => {
   }
 
   function _getSilenceThreshold() {
-    const el = document.getElementById('silenceThreshold2') ||
+    const el = document.getElementById('silenceMinDuration') ||
                document.getElementById('silenceThreshold');
     return parseFloat(el?.value || 0.4);
   }
@@ -870,6 +893,12 @@ const SilenceRemover = (() => {
    * @param {number} threshold  saniye (0.1 – 5.0)
    * @returns {Array} [{start, end, duration}]
    */
+  let _detectedSilences = [];
+
+  function getDetectedSilences() { return _detectedSilences; }
+
+  function setDetectedSilences(arr) { _detectedSilences = arr; }
+
   function scanSilences(threshold) {
     const words    = TranscriptStore.getWords();
     const silences = [];
@@ -883,6 +912,65 @@ const SilenceRemover = (() => {
       }
     }
     return silences;
+  }
+
+  async function scanSilencesFfmpeg(dbThreshold, minDuration) {
+    const wavPath = APIManager.getLastWavPath();
+    if (!wavPath) {
+      throw new Error('Aktif ses dosyası bulunamadı. Lütfen önce transkript oluşturun.');
+    }
+    if (typeof require !== 'function') {
+      throw new Error('Node.js entegrasyonu yok.');
+    }
+    const fs = require('fs');
+    const cp = require('child_process');
+
+    if (!fs.existsSync(wavPath)) {
+      throw new Error('WAV ses dosyası bulunamadı. Lütfen yeniden transkript oluşturun.');
+    }
+
+    const ff = APIManager.findFfmpeg();
+    if (!ff) {
+      throw new Error('FFmpeg bulunamadı.');
+    }
+
+    return new Promise((resolve, reject) => {
+      const args = [
+        '-i', wavPath,
+        '-af', `silencedetect=noise=${dbThreshold}dB:d=${minDuration}`,
+        '-f', 'null',
+        '-'
+      ];
+      cp.execFile(ff, args, { maxBuffer: 1 << 26 }, (err, stdout, stderr) => {
+        const output = stderr || '';
+        const silences = [];
+        const lines = output.split('\n');
+        
+        let currentStart = null;
+        const startRegex = /silence_start:\s*([0-9.]+)/i;
+        const endRegex   = /silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)/i;
+        const offset = APIManager.getLastWavOffset();
+
+        for (const line of lines) {
+          const startMatch = line.match(startRegex);
+          if (startMatch) {
+            currentStart = parseFloat(startMatch[1]) + offset;
+          }
+          const endMatch = line.match(endRegex);
+          if (endMatch && currentStart !== null) {
+            const end = parseFloat(endMatch[1]) + offset;
+            const dur = parseFloat(endMatch[2]);
+            silences.push({
+              start: parseFloat(currentStart.toFixed(3)),
+              end: parseFloat(end.toFixed(3)),
+              duration: parseFloat(dur.toFixed(3))
+            });
+            currentStart = null;
+          }
+        }
+        resolve(silences);
+      });
+    });
   }
 
   /**
@@ -991,7 +1079,7 @@ const SilenceRemover = (() => {
     });
   }
 
-  return { scanSilences, findRepeats, markFillers, deleteMarkedWords, applyRippleDelete, DEFAULT_FILLER };
+  return { scanSilences, scanSilencesFfmpeg, getDetectedSilences, setDetectedSilences, findRepeats, markFillers, deleteMarkedWords, applyRippleDelete, DEFAULT_FILLER };
 })();
 
 
@@ -1008,19 +1096,47 @@ const SubtitleEngine = (() => {
     shadowEnabled : true,
     highlightColor: '#FF6B3D',
     positionX     : 50,
-    positionY     : 85
+    positionY     : 85,
+    alignment     : 'center'
   };
 
   function getStyle()        { return { ..._style }; }
   function setStyle(updates) { Object.assign(_style, updates); _updatePreview(); }
 
+  function _getAlignmentTag(align, x, y) {
+    let tag = 2; // Bottom-Center
+    if (align === 'left') {
+      if (y < 33) tag = 7;
+      else if (y < 66) tag = 4;
+      else tag = 1;
+    } else if (align === 'center') {
+      if (y < 33) tag = 8;
+      else if (y < 66) tag = 5;
+      else tag = 2;
+    } else if (align === 'right') {
+      if (y < 33) tag = 9;
+      else if (y < 66) tag = 6;
+      else tag = 3;
+    }
+    return `{\\an${tag}}`;
+  }
+
   function _updatePreview() {
     const preview = document.getElementById('subtitlePreviewText');
     if (!preview) return;
     preview.style.fontFamily       = _style.fontFamily;
-    preview.style.fontSize         = Math.round(_style.fontSize * 0.35) + 'px';
+    preview.style.fontSize         = Math.max(12, Math.round(_style.fontSize * 0.35)) + 'px';
     preview.style.color            = _style.color;
     preview.style.webkitTextStroke = _style.strokeWidth + 'px ' + _style.strokeColor;
+    
+    preview.style.left = (_style.positionX !== undefined ? _style.positionX : 50) + '%';
+    preview.style.top  = (_style.positionY !== undefined ? _style.positionY : 85) + '%';
+    
+    preview.className = 'subtitle-preview-text';
+    if (_style.alignment) {
+      preview.classList.add('align-' + _style.alignment);
+    }
+    
     preview.innerHTML = `Merhaba <span class="hl">dünya</span> bu bir test`;
   }
 
@@ -1033,8 +1149,10 @@ const SubtitleEngine = (() => {
       throw new Error('Transkript boş. Önce transkript oluşturun.');
     }
 
+    const alignTag = _getAlignmentTag(_style.alignment, _style.positionX, _style.positionY);
+
     const segments = segmented.map(wordArr => ({
-      text : wordArr.map(w => w.word).join(' '),
+      text : alignTag + wordArr.map(w => w.word).join(' '),
       start: wordArr[0].start,
       end  : wordArr[wordArr.length - 1].end,
       words: wordArr.map(w => ({ word: w.word, start: w.start, end: w.end }))
@@ -1109,14 +1227,6 @@ const UIController = (() => {
         document.getElementById(tab.dataset.panel).classList.add('active');
       });
     });
-
-    // Sessizlik eşiği senkronizasyonu (iki input aynı değeri taşır)
-    const th1 = document.getElementById('silenceThreshold');
-    const th2 = document.getElementById('silenceThreshold2');
-    if (th1 && th2) {
-      th1.addEventListener('input', () => { th2.value = th1.value; TranscriptStore.notifyAll(); });
-      th2.addEventListener('input', () => { th1.value = th2.value; TranscriptStore.notifyAll(); });
-    }
 
     // API Key
     const keyInput = document.getElementById('apiKeyInput');
@@ -1213,11 +1323,114 @@ const UIController = (() => {
     // Stil kontrolleri
     _initStyleControls();
     _renderFillerChips();
+    _initDragAndDrop();
+
+    // Font tarama ve yukleme
+    setTimeout(() => {
+      const cs = window.getCSInterface ? window.getCSInterface() : null;
+      if (cs) {
+        log('Yerel fontlar taranıyor…', 'info');
+        cs.evalScript('getAvailableFonts()', (result) => {
+          try {
+            const res = JSON.parse(result);
+            if (res && res.success && res.fonts && res.fonts.length > 0) {
+              _injectFonts(res.fonts);
+              _populateFontDropdown(res.fonts);
+              log(`${res.fonts.length} adet yerel font yüklendi.`, 'success');
+            } else {
+              log('Yerel font bulunamadı veya fonts/ klasörü boş.', 'info');
+            }
+          } catch (e) {
+            log('Font yükleme hatası: ' + e.message, 'error');
+          }
+        });
+      }
+    }, 500);
 
     TranscriptEditor.init('transcriptArea');
     updateStats();
 
     log('Rast Flow AI hazır. 🚀', 'success');
+  }
+
+  function _injectFonts(fonts) {
+    let css = '';
+    fonts.forEach(f => {
+      const urlPath = 'file:///' + f.file.replace(/\\/g, '/');
+      const format = f.file.toLowerCase().endsWith('.otf') ? 'opentype' : 'truetype';
+      css += `
+        @font-face {
+          font-family: '${f.name}';
+          src: url('${urlPath}') format('${format}');
+          font-weight: ${f.weight === 'Regular' ? 'normal' : f.weight};
+          font-style: ${f.style};
+        }
+      `;
+    });
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+  }
+
+  function _populateFontDropdown(fonts) {
+    const select = document.getElementById('fontFamilySelect');
+    if (!select) return;
+    select.innerHTML = '<option value="Arial">Arial</option><option value="Helvetica">Helvetica</option>';
+    const added = new Set(['Arial', 'Helvetica']);
+    fonts.forEach(f => {
+      if (!added.has(f.name)) {
+        added.add(f.name);
+        const opt = document.createElement('option');
+        opt.value = f.name;
+        opt.textContent = f.name;
+        select.appendChild(opt);
+      }
+    });
+    if (fonts.length > 0) {
+      select.value = fonts[0].name;
+      SubtitleEngine.setStyle({ fontFamily: fonts[0].name });
+    }
+  }
+
+  function _initDragAndDrop() {
+    const container = document.getElementById('subtitlePreviewContainer');
+    const textEl    = document.getElementById('subtitlePreviewText');
+    const inputX    = document.getElementById('positionXInput');
+    const inputY    = document.getElementById('positionYInput');
+    const labelX    = document.getElementById('posXLabel');
+    const labelY    = document.getElementById('posYLabel');
+    
+    if (!container || !textEl) return;
+    
+    let isDragging = false;
+    
+    textEl.addEventListener('mousedown', (e) => {
+      isDragging = true;
+      e.preventDefault();
+    });
+    
+    document.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      
+      const rect = container.getBoundingClientRect();
+      let x = ((e.clientX - rect.left) / rect.width) * 100;
+      let y = ((e.clientY - rect.top) / rect.height) * 100;
+      
+      x = Math.max(5, Math.min(95, Math.round(x)));
+      y = Math.max(5, Math.min(95, Math.round(y)));
+      
+      if (inputX) { inputX.value = x; if (labelX) labelX.textContent = x; }
+      if (inputY) { inputY.value = y; if (labelY) labelY.textContent = y; }
+      
+      textEl.style.left = x + '%';
+      textEl.style.top  = y + '%';
+      
+      SubtitleEngine.setStyle({ positionX: x, positionY: y });
+    });
+    
+    document.addEventListener('mouseup', () => {
+      isDragging = false;
+    });
   }
 
   async function _onTranscribeClick() {
@@ -1245,8 +1458,8 @@ const UIController = (() => {
       const transcriptTab = document.querySelector('.tab[data-panel="panelTranscript"]');
       if (transcriptTab) transcriptTab.click();
 
-      // Otomatik sessizlik tarama
-      _onScanSilences();
+      // Otomatik sessizlik tarama (FFmpeg)
+      await _onScanSilences();
 
     } catch (e) {
       toast('Hata: ' + e.message, 'error');
@@ -1257,37 +1470,48 @@ const UIController = (() => {
     }
   }
 
-  function _getSilenceThreshold() {
-    const th2 = document.getElementById('silenceThreshold2');
-    const th1 = document.getElementById('silenceThreshold');
-    return parseFloat(th2?.value || th1?.value || 0.4);
-  }
-
-  function _onScanSilences() {
-    const threshold = _getSilenceThreshold();
-    const silences  = SilenceRemover.scanSilences(threshold);
-
-    _silenceDeleteList = [...silences]; // yeni tarama → listeyi sıfırla
-
-    TranscriptStore.notifyAll(); // renderer'ı güncelle (marker'lar yeniden çizilsin)
-
-    const countEl = document.getElementById('silenceCount');
-    if (countEl) countEl.textContent = silences.length + ' adet';
-
-    const totalDur = silences.reduce((a, s) => a + s.duration, 0);
-    const durEl    = document.getElementById('silenceTotalDur');
-    if (durEl) durEl.textContent = totalDur.toFixed(1) + 's';
-
-    toast(`${silences.length} sessizlik tespit edildi (toplam ${totalDur.toFixed(1)}s).`,
-      silences.length > 0 ? 'warn' : 'info');
-    log(silences.length + ' sessizlik bulundu (eşik: ' + threshold + 's, toplam: ' + totalDur.toFixed(1) + 's)', 'info');
+  async function _onScanSilences() {
+    const db = parseInt(document.getElementById('silenceDbThreshold')?.value || -30);
+    const minDur = parseFloat(document.getElementById('silenceMinDuration')?.value || 0.4);
+    
+    try {
+      _showLoading(true);
+      log(`FFmpeg desibel sessizlik analizi başlatılıyor (Eşik: ${db}dB, Min. Süre: ${minDur}s)…`, 'info');
+      
+      const silences = await SilenceRemover.scanSilencesFfmpeg(db, minDur);
+      
+      SilenceRemover.setDetectedSilences(silences);
+      _silenceDeleteList = [...silences]; // Auto queue all detected silences
+      
+      TranscriptStore.notifyAll(); // Re-render the transcript with silence bands
+      
+      const countEl = document.getElementById('silenceCount');
+      if (countEl) countEl.textContent = silences.length + ' adet';
+      
+      const totalDur = silences.reduce((a, s) => a + s.duration, 0);
+      const durEl    = document.getElementById('silenceTotalDur');
+      if (durEl) durEl.textContent = totalDur.toFixed(1) + 's';
+      
+      toast(`${silences.length} sessizlik tespit edildi (toplam ${totalDur.toFixed(1)}s).`,
+        silences.length > 0 ? 'warn' : 'info');
+      log(silences.length + ' desibel sessizliği bulundu (toplam: ' + totalDur.toFixed(1) + 's)', 'success');
+      
+    } catch (e) {
+      toast('Sessizlik tarama hatası: ' + e.message, 'error');
+      log('Sessizlik tarama hatası: ' + e.message, 'error');
+    } finally {
+      _showLoading(false);
+    }
   }
 
   function _onAddAllSilencesToList() {
-    if (_silenceDeleteList.length === 0) {
+    const silences = SilenceRemover.getDetectedSilences();
+    if (silences.length === 0) {
       toast('Önce "Sessizlikleri Tara" butonuna basın.', 'warn');
       return;
     }
+    _silenceDeleteList = [...silences];
+    TranscriptStore.notifyAll();
     toast(`${_silenceDeleteList.length} sessizlik silim listesine eklendi.`, 'info');
     log(_silenceDeleteList.length + ' sessizlik silim listesine alındı.', 'info');
   }
@@ -1313,8 +1537,6 @@ const UIController = (() => {
   async function _onApplyDelete() {
     const btn       = document.getElementById('applyDeleteBtn');
     const doRipple  = document.getElementById('rippleDeleteToggle')?.checked !== false;
-    const allTracks = document.getElementById('allTracksToggle')?.checked !== false;
-
     btn.disabled = true;
 
     try {
@@ -1365,7 +1587,6 @@ const UIController = (() => {
         toast('Altyazı SRT oluşturuldu! ✓', 'success');
         log(msg, 'success');
 
-        // Yolu göster
         const srtPathEl = document.getElementById('srtFilePath');
         if (srtPathEl) {
           srtPathEl.textContent = result.srtPath || '—';
@@ -1385,7 +1606,6 @@ const UIController = (() => {
     }
   }
 
-  /* ── Stil Kontrolleri ── */
   function _initStyleControls() {
     const controls = {
       fontFamily    : 'fontFamilySelect',
@@ -1394,6 +1614,7 @@ const UIController = (() => {
       strokeWidth   : 'strokeWidthInput',
       strokeColor   : 'strokeColorInput',
       highlightColor: 'highlightColorInput',
+      positionX     : 'positionXInput',
       positionY     : 'positionYInput'
     };
 
@@ -1420,6 +1641,36 @@ const UIController = (() => {
         document.querySelectorAll('.color-option[data-target="' + target + '"]')
           .forEach(x => x.classList.remove('selected'));
         sw.classList.add('selected');
+      });
+    });
+
+    // Position Presets
+    document.querySelectorAll('.preset-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const x = parseInt(btn.dataset.x);
+        const y = parseInt(btn.dataset.y);
+        
+        document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected');
+        
+        const inputX = document.getElementById('positionXInput');
+        const inputY = document.getElementById('positionYInput');
+        if (inputX) { inputX.value = x; const lx = document.getElementById('posXLabel'); if (lx) lx.textContent = x; }
+        if (inputY) { inputY.value = y; const ly = document.getElementById('posYLabel'); if (ly) ly.textContent = y; }
+        
+        SubtitleEngine.setStyle({ positionX: x, positionY: y });
+      });
+    });
+
+    // Alignment Buttons
+    document.querySelectorAll('.align-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const align = btn.dataset.align;
+        
+        document.querySelectorAll('.align-btn').forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected');
+        
+        SubtitleEngine.setStyle({ alignment: align });
       });
     });
   }
@@ -1453,15 +1704,28 @@ const UIController = (() => {
     container.appendChild(addChip);
   }
 
-  function addSilenceToDeleteList(range) {
-    // Çakışma kontrolü
-    const overlap = _silenceDeleteList.some(
-      r => r.start < range.end && r.end > range.start
-    );
-    if (!overlap) {
-      _silenceDeleteList.push(range);
+  function isSilenceQueued(silence) {
+    return _silenceDeleteList.some(s => Math.abs(s.start - silence.start) < 0.01 && Math.abs(s.end - silence.end) < 0.01);
+  }
+
+  function toggleSilenceQueue(silence, element) {
+    const idx = _silenceDeleteList.findIndex(s => Math.abs(s.start - silence.start) < 0.01 && Math.abs(s.end - silence.end) < 0.01);
+    if (idx >= 0) {
+      _silenceDeleteList.splice(idx, 1);
+      if (element) {
+        element.classList.remove('queued');
+        element.style.background = '#332c27';
+      }
+      toast('Sessizlik silim listesinden kaldırıldı.', 'info');
+    } else {
+      _silenceDeleteList.push(silence);
+      if (element) {
+        element.classList.add('queued');
+        element.style.background = 'var(--red)';
+      }
+      toast('Sessizlik silim listesine eklendi.', 'info');
     }
-    toast(`Sessizlik (${range.start.toFixed(2)}s – ${range.end.toFixed(2)}s) eklendi.`, 'info');
+    updateStats();
   }
 
   function updateStats() {
@@ -1477,7 +1741,6 @@ const UIController = (() => {
     set('statDuration',     _fmt(duration));
   }
 
-  /* ── Yardımcılar ── */
   function _showLoading(show) {
     const overlay = document.getElementById('loadingOverlay');
     if (overlay) overlay.style.display = show ? 'flex' : 'none';
@@ -1521,7 +1784,7 @@ const UIController = (() => {
     return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
   }
 
-  return { init, updateStats, addSilenceToDeleteList, log, toast };
+  return { init, updateStats, toggleSilenceQueue, isSilenceQueued, addSilenceToDeleteList: (range) => _silenceDeleteList.push(range), log, toast };
 })();
 
 /* ── DOM Hazır ── */

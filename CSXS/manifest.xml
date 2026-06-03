@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<ExtensionManifest Version="7.0" ExtensionBundleId="com.pr.workflow" ExtensionBundleVersion="1.0.0" ExtensionBundleName="PR Workflow AI">
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.pr.workflow" ExtensionBundleVersion="1.0.0" ExtensionBundleName="Rast Flow AI">
   <ExtensionList>
     <Extension Id="com.pr.workflow.panel" Version="1.0.0"/>
   </ExtensionList>
@@ -34,7 +34,7 @@
         </Lifecycle>
         <UI>
           <Type>Panel</Type>
-          <Menu>PR Workflow AI</Menu>
+          <Menu>Rast Flow AI</Menu>
           <Geometry>
             <Size>
               <Height>650</Height>
