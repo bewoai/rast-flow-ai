@@ -76,9 +76,15 @@
         <div class="section-title">Sessizlik Kaldırma</div>
         <div class="row">
           <div class="field">
-            <label>Eşik süresi (s)</label>
-            <input type="number" id="silenceThreshold2" value="0.4" min="0.05" max="5" step="0.05">
+            <label>Eşik Değeri (dB)</label>
+            <input type="number" id="silenceDbThreshold" value="-30" min="-60" max="-10" step="1">
           </div>
+          <div class="field">
+            <label>Min. Süre (s)</label>
+            <input type="number" id="silenceMinDuration" value="0.4" min="0.1" max="5" step="0.05">
+          </div>
+        </div>
+        <div class="row" style="margin-top:8px;">
           <div class="field">
             <label>Tespit edilen</label>
             <div class="silence-stat-row">
@@ -95,7 +101,7 @@
 
         <div class="silence-help">
           <span class="silence-help-icon">💡</span>
-          Transkript panelindeki turuncu <b>■</b> kutulara tıklayarak tek tek, ya da aşağıdaki butonla tümünü silim listesine ekleyin.
+          FFmpeg desibel analizini başlatmak için tarama yapın, ardından kesimi uygulamak için Premiere'e gönderin.
         </div>
 
         <div class="btn-group" style="margin-top:10px;">
@@ -152,9 +158,10 @@
 
       <div class="section">
         <div class="section-title">Önizleme</div>
-        <div class="subtitle-preview">
+        <div class="subtitle-preview" id="subtitlePreviewContainer">
           <div class="subtitle-preview-text" id="subtitlePreviewText">Kelime <span class="hl">kelime</span> animasyon</div>
         </div>
+        <div class="hint" style="text-align:center;">Önizlemedeki metni fareyle sürükleyerek de konumlandırabilirsiniz.</div>
       </div>
 
       <div class="section">
@@ -228,10 +235,41 @@
 
       <div class="section">
         <div class="section-title">Ekran Konumu</div>
-        <div class="field">
-          <label>Dikey: <span id="posYLabel">85</span>%</label>
-          <input type="range" id="positionYInput" min="5" max="95" value="85"
-            oninput="document.getElementById('posYLabel').textContent=this.value">
+        <div class="row">
+          <div class="field">
+            <label>Yatay (X): <span id="posXLabel">50</span>%</label>
+            <input type="range" id="positionXInput" min="5" max="95" value="50"
+              oninput="document.getElementById('posXLabel').textContent=this.value">
+          </div>
+          <div class="field">
+            <label>Dikey (Y): <span id="posYLabel">85</span>%</label>
+            <input type="range" id="positionYInput" min="5" max="95" value="85"
+              oninput="document.getElementById('posYLabel').textContent=this.value">
+          </div>
+        </div>
+        
+        <div class="field" style="margin-top: 10px;">
+          <label>Yatay Hizalama</label>
+          <div class="align-btn-group">
+            <button class="btn btn-secondary btn-sm align-btn" id="alignLeftBtn" data-align="left">◀ Sol</button>
+            <button class="btn btn-secondary btn-sm align-btn selected" id="alignCenterBtn" data-align="center">■ Orta</button>
+            <button class="btn btn-secondary btn-sm align-btn" id="alignRightBtn" data-align="right">▶ Sağ</button>
+          </div>
+        </div>
+
+        <div class="field" style="margin-top: 10px;">
+          <label>Konum Hazır Ayarları</label>
+          <div class="position-presets-grid">
+            <button class="preset-btn" data-x="15" data-y="15" title="Üst-Sol">↖</button>
+            <button class="preset-btn" data-x="50" data-y="15" title="Üst-Orta">↑</button>
+            <button class="preset-btn" data-x="85" data-y="15" title="Üst-Sağ">↗</button>
+            <button class="preset-btn" data-x="15" data-y="50" title="Orta-Sol">←</button>
+            <button class="preset-btn" data-x="50" data-y="50" title="Merkez">■</button>
+            <button class="preset-btn" data-x="85" data-y="50" title="Orta-Sağ">→</button>
+            <button class="preset-btn" data-x="15" data-y="85" title="Alt-Sol">↙</button>
+            <button class="preset-btn selected" data-x="50" data-y="85" title="Alt-Orta">↓</button>
+            <button class="preset-btn" data-x="85" data-y="85" title="Alt-Sağ">↘</button>
+          </div>
         </div>
       </div>
 
