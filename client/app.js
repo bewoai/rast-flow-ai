@@ -572,12 +572,12 @@ const TranscriptStore = (() => {
 
   function restoreWord(id) {
     const w = _words.find(x => x.id === id);
-    if (w) { w.deleted = false; w.repeat = false; w.filler = false; _notify(); }
+    if (w) { w.deleted = false; w.repeat = false; w.filler = false; w.aiDeleted = false; w.applied = false; w.aiReason = ''; _notify(); }
   }
 
   function markFiller(id, value) {
     const w = _words.find(x => x.id === id);
-    if (w) { pushUndo([id]); w.filler = value !== undefined ? value : !w.filler; _notify(); }
+    if (w) { w.filler = value !== undefined ? value : !w.filler; _notify(); }
   }
 
   function markRepeat(id, value) {
@@ -633,13 +633,28 @@ const TranscriptStore = (() => {
     return result;
   }
 
+  /** Bir kelime BEKLEYEN kesim mi? (işaretli ama henüz Premiere'e uygulanmamış) */
+  function _isCut(w) { return (w.deleted || w.filler || w.repeat || w.aiDeleted) && !w.applied; }
+
+  /** Apply sonrası: bekleyen tüm kesimleri "uygulandı" işaretle (çubuktan düşer, görünümden kalkar) */
+  function markAppliedCuts() {
+    _words.forEach(w => {
+      if (_isCut(w)) {
+        w.deleted = true; w.applied = true;
+        w.filler = false; w.repeat = false; w.aiDeleted = false;
+      }
+    });
+    _notify();
+  }
+
   /** Silinecek aralıkları hesapla — komşu sessizliği de dahil eder */
   function getDeleteRanges() {
-    const active  = _words.filter(w => !w.deleted);
-    const deleted = _words.filter(w => w.deleted);
-    const ranges  = [];
+    // Timeline'da KALAN kelimeler (hiçbir işareti olmayanlar)
+    const active = _words.filter(w => !w.deleted && !w.filler && !w.repeat && !w.aiDeleted);
+    const toCut  = _words.filter(_isCut);   // bekleyen (uygulanmamış) kesimler
+    const ranges = [];
 
-    for (const w of deleted) {
+    for (const w of toCut) {
       // Silinmiş kelimenin önceki aktif kelimesini bul
       const prevActive = active.filter(x => x.end <= w.start).pop();
       // Sonraki aktif kelimesini bul
@@ -685,6 +700,7 @@ const TranscriptStore = (() => {
     markFiller, markRepeat, insertWordAfter,
     addSegmentBreak, removeSegmentBreak,
     getSegmentedWords, getDeleteRanges,
+    markAppliedCuts,
     pushUndo, undo, onChange, notifyAll
   };
 })();
@@ -769,9 +785,9 @@ const TranscriptEditor = (() => {
             marker.dataset.start = s.start;
             marker.dataset.end   = s.end;
             marker.title = `${s.duration.toFixed(2)}s sessizlik — Tıkla ekle/kaldır`;
-            const w = Math.min(80, Math.max(12, s.duration * 20));
-            marker.style.width = w + 'px';
-            if (w > 35) marker.textContent = s.duration.toFixed(1) + 's';
+            const bandW = Math.min(80, Math.max(12, s.duration * 20));
+            marker.style.width = bandW + 'px';
+            if (bandW > 35) marker.textContent = s.duration.toFixed(1) + 's';
             marker.addEventListener('click', () => UIController.toggleSilenceQueue(s, marker));
             body.appendChild(marker);
           });
@@ -786,6 +802,10 @@ const TranscriptEditor = (() => {
 
         if (w.filler)  span.classList.add('filler');
         if (w.repeat)  span.classList.add('repeat');
+        if (w.aiDeleted) {
+          span.classList.add('ai-deleted');
+          if (w.aiReason) span.dataset.aiReason = w.aiReason;
+        }
         if (w.virtual) span.title = 'Interpolasyon ile eklendi';
 
         span.addEventListener('click',       _onWordClick);
@@ -925,14 +945,6 @@ const TranscriptEditor = (() => {
         TranscriptStore.deleteWord(id);
         break;
     }
-  }
-
-  function _onSilenceMarkerClick(e) {
-    const start = parseFloat(e.currentTarget.dataset.start);
-    const end   = parseFloat(e.currentTarget.dataset.end);
-    UIController.addSilenceToDeleteList({ start, end });
-    e.currentTarget.classList.add('queued');
-    e.currentTarget.title = '✓ Silim listesine eklendi';
   }
 
   function _closeContextMenu() {
@@ -1195,13 +1207,6 @@ const SilenceRemover = (() => {
     return count;
   }
 
-  function deleteMarkedWords() {
-    const words = TranscriptStore.getWords();
-    words.forEach(w => {
-      if (w.filler || w.repeat) TranscriptStore.deleteWord(w.id);
-    });
-  }
-
   /**
    * Sessizlikleri ve silinen kelimeleri ExtendScript'e gönder.
    * @param {Array}   ranges    [{start, end}]
@@ -1242,7 +1247,7 @@ const SilenceRemover = (() => {
     });
   }
 
-  return { scanSilences, scanSilencesFfmpeg, getDetectedSilences, setDetectedSilences, findRepeats, markFillers, deleteMarkedWords, applyRippleDelete, DEFAULT_FILLER };
+  return { scanSilences, scanSilencesFfmpeg, getDetectedSilences, setDetectedSilences, findRepeats, markFillers, applyRippleDelete, DEFAULT_FILLER };
 })();
 
 
@@ -1278,10 +1283,21 @@ const AIEditorEngine = (() => {
     if (modelEl) modelEl.addEventListener('change', () => _saveSettings({ ..._loadSettings(), model: modelEl.value }));
   }
 
-  const SYSTEM_PROMPT = `Sen bir video transkript editörüsün. Verilen kelime listesindeki kekelemeleri (stutters), dolgu seslerini (ıı, şey, ee, hm vb.), aynı cümlenin birden fazla kez denendiği hatalı çekimleri (multi-takes) ve gereksiz tekrarları tespit et.
-En akıcı ve doğal anlatımı koruyacak şekilde SİLİNMESİ GEREKEN kelimelerin ID'lerini belirle.
-SADECE şu JSON formatında yanıt ver, başka hiçbir şey yazma:
-{"deleted_word_ids":[<id sayıları>],"reasons":[{"id":<id>,"text":"<sebep>"}]}`;
+  const SYSTEM_PROMPT = `Sen titiz ve TUTUCU bir video transkript editörüsün. Amacın konuşmayı doğal ve akıcı tutmak; ASLA cümlenin anlamını veya gramerini bozmamak.
+
+SADECE şunları sil:
+- Saf dolgu sesleri: "ıı", "ee", "ee ee", "hmm", "ııı", "öö", "ee şey" gibi anlamı olmayan duraksamalar.
+- Kekemelik/yarım başlangıç: aynı kelimenin/hecenin takılı tekrarı ("bu-bu-bu bugün", "ben ben gittim" → fazlalık "ben").
+- Hatalı çekim (multi-take): konuşmacı aynı cümleyi baştan tekrar denediğinde, SADECE en son ve en akıcı denemeyi tut, önceki yarım/bozuk denemeleri sil.
+
+ASLA SİLME (bunlar anlam taşır):
+- Bağlaçlar ve edatlar: "ve", "ama", "ancak", "fakat", "çünkü", "ki", "ya da", "veya", "için", "ile", "de/da", "ise", "gibi", "kadar" vb.
+- İçerik kelimeleri: isim, fiil, sıfat, zarf — cümlenin anlamını taşıyan hiçbir kelime.
+- Tek başına geçen, bağlam içinde anlamlı normal kelimeler.
+
+Kararsız kaldığında SİLME — kelimeyi koru. Az silmek çok silmekten iyidir.
+SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
+{"deleted_word_ids":[<id sayıları>],"reasons":[{"id":<id>,"text":"<kısa sebep: Dolgu | Kekemelik | Hatalı Çekim>"}]}`;
 
   async function cleanTranscriptWithAI(onStatus) {
     const settings = _loadSettings();
@@ -1317,27 +1333,26 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir şey yazma:
     const deletedIds = parsed.deleted_word_ids || [];
     _reasons = parsed.reasons || [];
 
-    TranscriptStore.pushUndo(deletedIds);
+    const reasonMap = {};
+    _reasons.forEach(r => { reasonMap[String(r.id)] = r.text; });
+
+    // Tek undo anlık görüntüsü (Alt+Z ile tüm AI geçişi geri alınabilir)
+    TranscriptStore.pushUndo(deletedIds.map(String));
+
+    let matched = 0;
     deletedIds.forEach(id => {
-      const w = TranscriptStore.getWords(true).find(x => x.id === id);
-      if (w) { w.deleted = true; w.aiDeleted = true; }
+      const w = TranscriptStore.getWords(true).find(x => String(x.id) === String(id));
+      if (w) {
+        // Yumuşak işaret: görünür kalır (üstü çizili), alt çubuktan kesilir
+        w.aiDeleted = true;
+        w.aiReason  = reasonMap[String(id)] || 'AI kesimi';
+        matched++;
+      }
     });
 
     TranscriptStore.notifyAll();
-    _applyAiDeletedClass(deletedIds);
 
-    return { deletedCount: deletedIds.length, reasons: _reasons };
-  }
-
-  function _applyAiDeletedClass(deletedIds) {
-    const idSet = new Set(deletedIds.map(String));
-    document.querySelectorAll('.word').forEach(span => {
-      if (idSet.has(span.dataset.id)) {
-        span.classList.add('ai-deleted');
-        const reason = _reasons.find(r => String(r.id) === span.dataset.id);
-        if (reason) span.dataset.aiReason = reason.text;
-      }
-    });
+    return { deletedCount: matched, reasons: _reasons };
   }
 
   async function _callApiNode(apiKey, model, isAnthropic, userContent, onStatus) {
@@ -1776,6 +1791,15 @@ const UIController = (() => {
     const applyDeleteBtn = document.getElementById('applyDeleteBtn');
     if (applyDeleteBtn) applyDeleteBtn.addEventListener('click', _onApplyDelete);
 
+    // Yapışkan çubuk: Uygula + Geri Al
+    const pendingApplyBtn = document.getElementById('pendingApplyBtn');
+    if (pendingApplyBtn) pendingApplyBtn.addEventListener('click', _onApplyDelete);
+    const pendingUndoBtn = document.getElementById('pendingUndoBtn');
+    if (pendingUndoBtn) pendingUndoBtn.addEventListener('click', () => {
+      if (TranscriptStore.undo()) toast('Geri alındı (Alt+Z).', 'info');
+      else toast('Geri alınacak işlem yok.', 'warn');
+    });
+
     // Altyazı oluştur
     const genSubBtn = document.getElementById('generateSubtitlesBtn');
     if (genSubBtn) genSubBtn.addEventListener('click', _onGenerateSubtitles);
@@ -1967,25 +1991,37 @@ const UIController = (() => {
     try {
       _showLoading(true);
       log(`FFmpeg desibel sessizlik analizi başlatılıyor (Eşik: ${db}dB, Min. Süre: ${minDur}s)…`, 'info');
-      
-      const silences = await SilenceRemover.scanSilencesFfmpeg(db, minDur);
-      
+
+      let silences = [];
+      let method   = 'FFmpeg dB';
+      try {
+        silences = await SilenceRemover.scanSilencesFfmpeg(db, minDur);
+      } catch (ffErr) {
+        log('FFmpeg taraması yapılamadı (' + ffErr.message + ') — kelime boşluğu yöntemine geçiliyor.', 'warn');
+      }
+
+      // FFmpeg yoksa/sonuç boşsa: kelime zaman damgalarından boşluk tabanlı tespit
+      if (!silences || silences.length === 0) {
+        silences = SilenceRemover.scanSilences(minDur);
+        method   = 'kelime boşluğu';
+      }
+
       SilenceRemover.setDetectedSilences(silences);
-      _silenceDeleteList = [...silences]; // Auto queue all detected silences
-      
-      TranscriptStore.notifyAll(); // Re-render the transcript with silence bands
-      
+      _silenceDeleteList = [...silences]; // Tespit edilen tüm sessizlikleri otomatik kuyruğa al
+
+      TranscriptStore.notifyAll(); // Sessizlik bantlarıyla yeniden çiz
+
       const countEl = document.getElementById('silenceCount');
       if (countEl) countEl.textContent = silences.length + ' adet';
-      
+
       const totalDur = silences.reduce((a, s) => a + s.duration, 0);
       const durEl    = document.getElementById('silenceTotalDur');
       if (durEl) durEl.textContent = totalDur.toFixed(1) + 's';
-      
-      toast(`${silences.length} sessizlik tespit edildi (toplam ${totalDur.toFixed(1)}s).`,
+
+      toast(`${silences.length} sessizlik tespit edildi (${method}, toplam ${totalDur.toFixed(1)}s).`,
         silences.length > 0 ? 'warn' : 'info');
-      log(silences.length + ' desibel sessizliği bulundu (toplam: ' + totalDur.toFixed(1) + 's)', 'success');
-      
+      log(`${silences.length} sessizlik bulundu (${method}, toplam: ${totalDur.toFixed(1)}s)`, 'success');
+
     } catch (e) {
       toast('Sessizlik tarama hatası: ' + e.message, 'error');
       log('Sessizlik tarama hatası: ' + e.message, 'error');
@@ -2067,13 +2103,15 @@ const UIController = (() => {
   function _onMarkFillers() {
     const count = SilenceRemover.markFillers(_fillerList);
     TranscriptStore.notifyAll();
-    toast(`${count} filler kelime işaretlendi (turuncu).`, count > 0 ? 'warn' : 'info');
+    toast(count > 0
+      ? `${count} filler işaretlendi — alt çubuktan "Premiere'e Uygula" ile kes.`
+      : 'Filler kelime bulunamadı.', count > 0 ? 'warn' : 'info');
   }
 
   async function _onApplyDelete() {
-    const btn       = document.getElementById('applyDeleteBtn');
+    const btns      = [document.getElementById('applyDeleteBtn'), document.getElementById('pendingApplyBtn')].filter(Boolean);
     const doRipple  = document.getElementById('rippleDeleteToggle')?.checked !== false;
-    btn.disabled = true;
+    btns.forEach(b => b.disabled = true);
 
     try {
       const wordRanges = TranscriptStore.getDeleteRanges();
@@ -2093,6 +2131,7 @@ const UIController = (() => {
         toast(`${result.deletedCount} kesim uygulandı ✓`, 'success');
         log('Ripple delete tamamlandı: ' + result.deletedCount + ' kesim.', 'success');
         _silenceDeleteList = [];
+        TranscriptStore.markAppliedCuts(); // bekleyen kesimler "uygulandı" → çubuk temizlenir, görünüm güncellenir
         const countEl = document.getElementById('silenceCount');
         if (countEl) countEl.textContent = '0 adet';
       } else {
@@ -2104,8 +2143,9 @@ const UIController = (() => {
       toast('Hata: ' + e.message, 'error');
       log('Hata: ' + e.message, 'error');
     } finally {
-      btn.disabled = false;
+      btns.forEach(b => b.disabled = false);
       _showLoading(false);
+      updatePendingBar();
     }
   }
 
@@ -2140,7 +2180,7 @@ const UIController = (() => {
           const item = document.createElement('div');
           item.className = 'ai-reason-item';
 
-          const wordEl = TranscriptStore.getWords(true).find(w => w.id === r.id);
+          const wordEl = TranscriptStore.getWords(true).find(w => String(w.id) === String(r.id));
           const wordText = wordEl ? wordEl.word : '(?)';
 
           item.innerHTML = `
@@ -2182,9 +2222,12 @@ const UIController = (() => {
     _showLoading(true);
     try {
       const result = await SubtitleEngine.injectToTimeline();
-      if (result.success) {
-        toast(`${result.createdCount} Essential Graphics klibi oluşturuldu ✓`, 'success');
+      if (result.success && result.createdCount > 0) {
+        toast(`${result.createdCount} altyazı klibi oluşturuldu ✓`, 'success');
         log('Timeline enjeksiyonu tamamlandı: ' + result.createdCount + ' klip.', 'success');
+      } else if (result.success && result.createdCount === 0) {
+        toast('Hiç klip oluşturulamadı. Bu Premiere sürümü createGraphicClip\'i desteklemiyor olabilir — "SRT İndir" veya Caption Track yöntemini kullanın.', 'warn');
+        log('Enjeksiyon 0 klip döndü (createGraphicClip desteklenmiyor olabilir).', 'warn');
       } else {
         toast('Enjeksiyon hatası: ' + result.error, 'error');
         log('Hata: ' + result.error, 'error');
@@ -2398,6 +2441,26 @@ const UIController = (() => {
     set('statDeletedCount', deleted);
     set('statSegCount',     segs);
     set('statDuration',     _fmt(duration));
+
+    updatePendingBar();
+  }
+
+  /** Yapışkan "Premiere'e Uygula" çubuğunu güncelle (her render'da çağrılır) */
+  function updatePendingBar() {
+    const bar = document.getElementById('pendingBar');
+    if (!bar) return;
+
+    const wordRanges = TranscriptStore.getDeleteRanges();
+    const allRanges  = [...wordRanges, ..._silenceDeleteList];
+    const count      = allRanges.length;
+    const dur        = allRanges.reduce((a, r) => a + Math.max(0, r.end - r.start), 0);
+
+    const countEl = document.getElementById('pendingCount');
+    const durEl   = document.getElementById('pendingDur');
+    if (countEl) countEl.textContent = count;
+    if (durEl)   durEl.textContent   = dur.toFixed(1) + 's';
+
+    bar.classList.toggle('visible', count > 0);
   }
 
   function _showLoading(show) {
@@ -2443,7 +2506,7 @@ const UIController = (() => {
     return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
   }
 
-  return { init, updateStats, toggleSilenceQueue, isSilenceQueued, addSilenceToDeleteList: (range) => _silenceDeleteList.push(range), log, toast };
+  return { init, updateStats, toggleSilenceQueue, isSilenceQueued, log, toast };
 })();
 
 /* ── DOM Hazır ── */

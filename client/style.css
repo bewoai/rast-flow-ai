@@ -629,6 +629,39 @@ input[type=range]::-webkit-slider-thumb {
 
 .hint { font-size: 9.5px; color: var(--text-2); line-height: 1.6; margin-top: 6px; }
 
+/* ── Yapışkan Uygula Çubuğu ─────────────────────────────── */
+.pending-bar {
+  flex-shrink: 0;
+  display: none;                 /* JS ile görünür yapılır */
+  align-items: center; justify-content: space-between; gap: 10px;
+  margin: 0 16px 12px; padding: 9px 12px 9px 14px;
+  background: linear-gradient(150deg, var(--bg-3), var(--bg-2));
+  border: 1px solid var(--accent);
+  border-radius: var(--r-pill);
+  box-shadow: 0 6px 20px rgba(0,0,0,.4), 0 0 0 1px var(--accent-soft), inset 0 1px 0 rgba(255,255,255,.06);
+  animation: pendingIn .3s var(--spring);
+}
+.pending-bar.visible { display: flex; }
+@keyframes pendingIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+
+.pending-info { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.pending-badge {
+  flex-shrink: 0;
+  min-width: 22px; height: 22px; padding: 0 6px;
+  border-radius: var(--r-pill);
+  background: linear-gradient(150deg, var(--accent-bright), var(--accent));
+  color: #fff; font-weight: 800; font-size: 12px;
+  display: inline-flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 8px var(--accent-glow);
+}
+.pending-text { font-size: 11.5px; color: var(--text-1); font-weight: 600; white-space: nowrap; }
+.pending-dur {
+  font-size: 10.5px; color: var(--text-2); font-family: ui-monospace, monospace;
+  background: var(--bg-0); padding: 2px 7px; border-radius: var(--r-pill);
+}
+.pending-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.pending-actions .btn-sm { padding: 7px 11px; }
+
 /* ── AI Deleted word ───────────────────────────────────── */
 .word.ai-deleted {
   color: var(--text-3);
