@@ -26,3 +26,6 @@ Thumbs.db
 # Node modules
 node_modules/
 dist/
+
+# Third-party reverse-engineering reference (sliding bundled app — telifli, repoya girmez)
+/index.js
