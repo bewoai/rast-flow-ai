@@ -27,7 +27,7 @@ Thumbs.db
 node_modules/
 dist/
 
-# Third-party reverse-engineering reference (sliding bundled app — telifli, repoya girmez)
+# Local reference bundle (telifli, repoya girmez)
 /index.js
 
 # Secrets and Config

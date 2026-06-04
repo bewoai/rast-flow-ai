@@ -44,17 +44,17 @@ Lütfen mevcut kod yapısını (özellikle TranscriptEditor.render, SubtitleEngi
 
 ---
 
-## 📋 [PROMPT 2] — sliding Puanlamalı Tekrar Avcısı, Alt+Z Geri Alma & Whisper Parçalama
+## 📋 [PROMPT 2] — Puanlamalı Tekrar Avcısı, Alt+Z Geri Alma & Whisper Parçalama
 
-**Hedef**: sliding'ın özel kayan pencere tekrar eşleme algoritmasını entegre etmek, görsel tekrar kartları oluşturmak, `Alt + Z` kısayollu Undo motorunu yazmak ve uzun sesler için Whisper dilimleme eklemek.
+**Hedef**: Özel kayan pencere tekrar eşleme algoritmasını entegre etmek, görsel tekrar kartları oluşturmak, `Alt + Z` kısayollu Undo motorunu yazmak ve uzun sesler için Whisper dilimleme eklemek.
 
 ```markdown
-Rast Flow AI projemize sliding'ın matematiksel tekrar algılama motorunu, "Alt + Z" ile çakışmasız geri alma (Undo) motorunu ve büyük dosyalar için otomatik parçalama eklemek istiyoruz.
+Rast Flow AI projemize matematiksel tekrar algılama motorunu, "Alt + Z" ile çakışmasız geri alma (Undo) motorunu ve büyük dosyalar için otomatik parçalama eklemek istiyoruz.
 
 Lütfen kod üzerinde şu geliştirmeleri yap:
 
-1. sliding Algoritması ile Tekrar Avcısı (app.js - findRepeats):
-- `findRepeats(method)` fonksiyonunu sliding'ın sliding-window (kayan pencere) sequence-matcher algoritmasına göre güncelle.
+1. Kayan Pencere Algoritması ile Tekrar Avcısı (app.js - findRepeats):
+- `findRepeats(method)` fonksiyonunu sliding-window (kayan pencere) sequence-matcher algoritmasına göre güncelle.
 - Algoritma, kelimeleri noktalama işaretlerinden temizleyip normalleştirerek `u` (1'den 10'a kadar) uzunluğundaki kelime öbeklerinin ardışık tekrarlarını (`l` kez) taramalıdır.
 - Her tekrar grubu için şu formüle göre skor hesapla: Score = u * (l - 1) - 2. Sadece Score >= 0 ve l > 1 olan tekrarları yakala.
   * (Bu formül sayesinde "bence bence" gibi 2'li kelimeler elenirken, 3'lü "bence bence bence" veya 2 kelimelik öbek tekrarları "şöyle ki şöyle ki" başarıyla yakalanır).
@@ -150,7 +150,7 @@ Lütfen şu geliştirmeleri yap:
 ```markdown
 [PROMPT 5] — AI Editor: Yapay Zeka ile Anlamlı Transkript Temizleme & Çekim Seçimi (app.js, index.html, style.css)
 
-Rast Flow AI projemize, sliding'ın OpenAI entegrasyonundan ilham alan ve transkripti anlamlı bir şekilde temizleyip hatalı çekimleri (multi-take) eleyen gelişmiş bir "AI Editor" sekmesi ve motoru eklemek istiyoruz.
+Rast Flow AI projemize, OpenAI entegrasyonuyla transkripti anlamlı bir şekilde temizleyip hatalı çekimleri (multi-take) eleyen gelişmiş bir "AI Editor" sekmesi ve motoru eklemek istiyoruz.
 
 Lütfen mevcut kod yapısına şu özellikleri entegre et:
 

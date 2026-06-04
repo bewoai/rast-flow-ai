@@ -2,8 +2,8 @@ PR Workflow AI — FFmpeg
 ========================
 
 Bu eklenti, Premiere export/preset pipeline'ını KULLANMADAN, timeline'daki
-klibin kaynak medya dosyasından sesi doğrudan FFmpeg ile çıkarır (sliding /
-sliding'ın yaptığı gibi). Adobe Media Encoder veya .epr preset GEREKMEZ.
+klibin kaynak medya dosyasından sesi doğrudan FFmpeg ile çıkarır. Adobe Media
+Encoder veya .epr preset GEREKMEZ.
 
 KURULUM (bir kez, paketleme aşamasında):
 -----------------------------------------

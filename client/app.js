@@ -1447,7 +1447,7 @@ const SilenceRemover = (() => {
       return repeats;
     }
 
-    // sliding kayan-pencere algoritması
+    // Kayan-pencere tekrar algoritması
     const n          = words.length;
     const normalized = words.map(w => _norm(w.word));
     const repeatGroups = [];
