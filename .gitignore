@@ -29,3 +29,7 @@ dist/
 
 # Third-party reverse-engineering reference (sliding bundled app — telifli, repoya girmez)
 /index.js
+
+# Secrets and Config
+.env
+.secret.key

@@ -14,7 +14,7 @@
   <div class="header">
     <img src="./assets/logo.png" alt="Rast Flow AI" class="header-logo-img" id="headerLogo">
     <div class="header-spacer"></div>
-    <div class="icon-btn" id="settingsBtn" title="Ayarlar">⚙</div>
+    <div class="icon-btn" id="settingsBtn" title="Ayarlar" role="button" tabindex="0" aria-label="Ayarlar">⚙</div>
   </div>
 
   <!-- ── Tab strip ────────────────────────────────────────── -->
@@ -33,13 +33,9 @@
       <button class="btn btn-secondary btn-sm" id="punctuateBtn" title="AI ile Türkçe noktalama ekle">¶</button>
       <button class="btn btn-secondary btn-sm" id="autoSegmentBtn" title="Cümle cümle otomatik böl">🪄</button>
       <button class="btn btn-secondary btn-sm" id="findReplaceToggle" title="Bul & Değiştir">🔁</button>
-      <button class="btn btn-secondary btn-sm" title="Tümünü seç"
-        onclick="document.querySelectorAll('.word').forEach(w=>w.classList.add('selected'))">☑</button>
-      <button class="btn btn-secondary btn-sm" title="Seçimi temizle"
-        onclick="document.querySelectorAll('.word').forEach(w=>w.classList.remove('selected'))">☐</button>
-      <button class="btn btn-secondary btn-sm" title="Kopyala" onclick="
-        const t=Array.from(document.querySelectorAll('.word')).map(w=>w.textContent).join(' ');
-        navigator.clipboard.writeText(t); UIController.toast('Panoya kopyalandı.','success');">⧉</button>
+      <button class="btn btn-secondary btn-sm" id="btnSelectAll" title="Tümünü seç">☑</button>
+      <button class="btn btn-secondary btn-sm" id="btnClearSelect" title="Seçimi temizle">☐</button>
+      <button class="btn btn-secondary btn-sm" id="btnCopyText" title="Kopyala">⧉</button>
       <div class="silence-control">
         <span>Sessizlik</span>
         <input type="number" id="silenceThreshold" value="0.4" min="0.1" max="5" step="0.1">
@@ -247,13 +243,11 @@
         <div class="row">
           <div class="field">
             <label>Yatay (X): <span id="posXLabel">50</span>%</label>
-            <input type="range" id="positionXInput" min="5" max="95" value="50"
-              oninput="document.getElementById('posXLabel').textContent=this.value">
+            <input type="range" id="positionXInput" min="5" max="95" value="50">
           </div>
           <div class="field">
             <label>Dikey (Y): <span id="posYLabel">85</span>%</label>
-            <input type="range" id="positionYInput" min="5" max="95" value="85"
-              oninput="document.getElementById('posYLabel').textContent=this.value">
+            <input type="range" id="positionYInput" min="5" max="95" value="85">
           </div>
         </div>
         
@@ -333,8 +327,7 @@
             </div>
             <div class="field">
               <label>Opaklık: <span id="bgOpacityLabel">75</span>%</label>
-              <input type="range" id="bgOpacityInput" min="0" max="100" value="75"
-                oninput="document.getElementById('bgOpacityLabel').textContent=this.value">
+              <input type="range" id="bgOpacityInput" min="0" max="100" value="75">
             </div>
           </div>
         </div>
@@ -451,7 +444,7 @@
     <img src="./assets/logo.png" alt="Rast Flow AI" style="height:22px;object-fit:contain;">
     <div class="drawer-title">Ayarlar</div>
     <div class="header-spacer"></div>
-    <div class="icon-btn" id="settingsClose" title="Kapat">✕</div>
+    <div class="icon-btn" id="settingsClose" title="Kapat" role="button" tabindex="0" aria-label="Kapat Ayarlar">✕</div>
   </div>
   <div class="drawer-body">
 
@@ -481,17 +474,11 @@
 
     <div class="section">
       <div class="section-title">Kaynak & Aralık</div>
-      <div class="field">
-        <div class="toggle-row">
-          <span class="toggle-label">Sadece In/Out aralığı</span>
-          <label class="toggle"><input type="checkbox" id="inOutOnly" checked><span class="toggle-slider"></span></label>
-        </div>
+      <div class="hint" style="margin-bottom:8px;">
+        Kapsam (Tüm Sekans / In-Out / Seçili Klipler) artık her transkriptte
+        açılan pencereden seçilir.
       </div>
-      <button class="btn btn-secondary btn-full" id="refreshSeqBtn" onclick="
-        const cs=window.getCSInterface&&getCSInterface();
-        if(cs){cs.evalScript('getSequenceInfo()',r=>{try{const d=JSON.parse(r);
-        document.getElementById('seqInfo').textContent=d.success?d.name+' — '+d.videoTracks+'V / '+d.audioTracks+'A — '+d.duration.toFixed(1)+'s':'Sekans yok';}catch(e){document.getElementById('seqInfo').textContent='Hata';}});}
-        else{document.getElementById('seqInfo').textContent='CEP yok (geliştirme)';}">Sekans Bilgisini Al</button>
+      <button class="btn btn-secondary btn-full" id="refreshSeqBtn">Sekans Bilgisini Al</button>
       <div id="seqInfo" class="hint" style="margin-top:7px;font-family:ui-monospace,monospace;">—</div>
     </div>
 
@@ -507,6 +494,39 @@
     </div>
 
   </div>
+</div>
+
+<!-- ══════════ TRANSKRİPT KAPSAM SEÇİCİ (Modal) ══════════ -->
+<div class="scope-backdrop" id="scopeBackdrop"></div>
+<div class="scope-modal" id="scopeModal">
+  <div class="scope-head">
+    <div class="scope-title">Neyi transkript edelim?</div>
+    <div class="icon-btn" id="scopeClose" title="Kapat" role="button" tabindex="0" aria-label="Kapat Kapsam">✕</div>
+  </div>
+  <div class="scope-seq-name" id="scopeSeqName">—</div>
+
+  <!-- Mini-timeline -->
+  <div class="scope-tl-wrap">
+    <div class="scope-tl-ruler" id="scopeRuler"></div>
+    <div class="scope-tl" id="scopeTimeline"></div>
+  </div>
+
+  <!-- 3 kapsam seçeneği -->
+  <div class="scope-options">
+    <button class="scope-opt" data-scope="full" id="scopeFullBtn">
+      <span class="scope-opt-ico">▦</span>
+      <span class="scope-opt-text"><b>Tüm Sekans</b><span class="scope-opt-sub" id="scopeFullSub">—</span></span>
+    </button>
+    <button class="scope-opt" data-scope="inout" id="scopeInoutBtn">
+      <span class="scope-opt-ico">⟦⟧</span>
+      <span class="scope-opt-text"><b>In/Out Aralığı</b><span class="scope-opt-sub" id="scopeInoutSub">—</span></span>
+    </button>
+    <button class="scope-opt" data-scope="selected" id="scopeSelectedBtn">
+      <span class="scope-opt-ico">▣</span>
+      <span class="scope-opt-text"><b>Seçili Klipler</b><span class="scope-opt-sub" id="scopeSelectedSub">—</span></span>
+    </button>
+  </div>
+  <div class="hint" style="text-align:center;margin-top:4px;">Seçtiğin kapsam Whisper'a gönderilir.</div>
 </div>
 
 <!-- ── Loading / Toast ── -->

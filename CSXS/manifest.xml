@@ -7,7 +7,7 @@
   <ExecutionEnvironment>
     <HostList>
       <!-- Premiere Pro 2023 (v23.x) -->
-      <Host Name="PPRO" Version="[23.0,27.9]"/>
+      <Host Name="PPRO" Version="[23.0,99.9]"/>
     </HostList>
     <LocaleList>
       <Locale Code="All"/>
@@ -26,7 +26,6 @@
           <CEFCommandLine>
             <Parameter>--enable-nodejs</Parameter>
             <Parameter>--mixed-context</Parameter>
-            <Parameter>--disable-web-security</Parameter>
           </CEFCommandLine>
         </Resources>
         <Lifecycle>
@@ -49,10 +48,7 @@
               <Width>800</Width>
             </MaxSize>
           </Geometry>
-          <Icons>
-            <Icon Type="Normal">./client/assets/icon_normal.png</Icon>
-            <Icon Type="RollOver">./client/assets/icon_hover.png</Icon>
-          </Icons>
+
         </UI>
       </DispatchInfo>
     </Extension>

@@ -27,9 +27,22 @@ const APIManager = (() => {
   function _getDeviceKey() {
     try {
       const crypto = require('crypto');
-      const os     = require('os');
-      const seed   = 'rastflowai-v1-' + os.hostname() + '-' + (os.userInfo ? os.userInfo().username : 'usr');
-      return crypto.createHash('sha256').update(seed).digest();
+      const fs = require('fs');
+      const path = require('path');
+      const os = require('os');
+      const secretFile = path.join(os.homedir(), '.rastflowai', '.secret.key');
+      let secret;
+      if (fs.existsSync(secretFile)) {
+        secret = fs.readFileSync(secretFile, 'utf8');
+      } else {
+        secret = crypto.randomBytes(32).toString('hex');
+        try {
+          const dir = path.dirname(secretFile);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(secretFile, secret, { mode: 0o600 });
+        } catch(e){}
+      }
+      return crypto.createHash('sha256').update(secret).digest();
     } catch (e) { return null; }
   }
 
@@ -136,13 +149,15 @@ const APIManager = (() => {
     const key = getApiKey();
     if (!key) throw new Error('API Key girilmemiş. Lütfen Ayarlar\'dan API Key girin.');
 
-    const useInOutOnly = options.useInOutOnly === true;
-    const language     = options.language || 'tr';
+    const scope    = options.scope || 'full';
+    const language = options.language || 'tr';
 
-    onProgress && onProgress(5,
-      useInOutOnly ? 'In/Out aralığı analiz ediliyor…' : 'Sekans analiz ediliyor…');
+    const scopeMsg = scope === 'inout' ? 'In/Out aralığı'
+                   : scope === 'selected' ? 'Seçili klipler'
+                   : 'Tüm sekans';
+    onProgress && onProgress(5, scopeMsg + ' analiz ediliyor…');
 
-    const segRaw = await _evalScript('getTimelineAudioSegments(' + (useInOutOnly ? 'true' : 'false') + ')');
+    const segRaw = await _evalScript("getTimelineAudioSegments('" + scope + "')");
     let info;
     try {
       info = JSON.parse(segRaw);
@@ -265,7 +280,7 @@ const APIManager = (() => {
     const cache = {};
     async function getDecoded(p) {
       if (cache[p]) return cache[p];
-      const buf      = fs.readFileSync(p);
+      const buf      = await fs.promises.readFile(p);
       const arrayBuf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
       const ctx      = new AC();
       try {
@@ -295,7 +310,7 @@ const APIManager = (() => {
     }
 
     const outPath = path.join(os.tmpdir(), 'rastflow_audio_' + Date.now() + '.wav');
-    fs.writeFileSync(outPath, Buffer.from(_encodeWav(out, targetSR)));
+    await fs.promises.writeFile(outPath, Buffer.from(_encodeWav(out, targetSR)));
     return outPath;
   }
 
@@ -326,7 +341,8 @@ const APIManager = (() => {
   }
 
   function _concatWithFfmpeg(segments, rangeStart, rangeEnd, onProgress) {
-    return new Promise(async (resolve, reject) => {
+    return new Promise((resolve, reject) => {
+      (async () => {
       try {
         const fs   = require('fs');
         const path = require('path');
@@ -390,6 +406,7 @@ const APIManager = (() => {
       } catch (e) {
         reject(e);
       }
+      })();
     });
   }
 
@@ -418,7 +435,7 @@ const APIManager = (() => {
           return;
         }
 
-        const fileBuffer = fs.readFileSync(filePath);
+        const fileBuffer = await fs.promises.readFile(filePath);
         const fileName   = path.basename(filePath);
         const boundary   = '----RastFlowAIBoundary' + Date.now();
 
@@ -516,41 +533,7 @@ const APIManager = (() => {
     return Buffer.concat([header, fileBuffer, Buffer.from('\r\n')]);
   }
 
-  /* ── Ses Çıkarma ── */
-  async function _extractAudio(srcPath, srcStart, duration) {
-    if (typeof require !== 'function') {
-      throw new Error('Node.js entegrasyonu yok. manifest.xml --enable-nodejs kontrol edin.');
-    }
-    const fs   = require('fs');
-    const path = require('path');
-    const os   = require('os');
-    const cp   = require('child_process');
 
-    const outWav = path.join(os.tmpdir(), 'rastflow_audio_' + Date.now() + '.wav');
-
-    const ff = _findFfmpeg();
-    if (ff) {
-      try {
-        await new Promise((resolve, reject) => {
-          const args = [
-            '-ss', String(srcStart),   // input-seeking: -i'den ÖNCE (10x hızlı)
-            '-i', srcPath,
-            '-t',  String(duration),
-            '-vn', '-ac', '1', '-ar', '16000',
-            '-c:a', 'pcm_s16le',
-            '-y', outWav
-          ];
-          cp.execFile(ff, args, { maxBuffer: 1 << 28 }, (err) => {
-            if (err) reject(new Error(err.message));
-            else resolve();
-          });
-        });
-        if (fs.existsSync(outWav) && fs.statSync(outWav).size > 0) return outWav;
-      } catch (e) {}
-    }
-
-    return await _extractAudioWebAudio(srcPath, srcStart, duration, outWav);
-  }
 
   function _findFfmpeg() {
     try {
@@ -582,52 +565,7 @@ const APIManager = (() => {
     } catch (e) { return null; }
   }
 
-  async function _extractAudioWebAudio(srcPath, srcStart, duration, outWav) {
-    const fs = require('fs');
-    const buf = fs.readFileSync(srcPath);
-    const arrayBuf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) throw new Error('Ses çözücü kullanılamıyor ve FFmpeg bulunamadı.');
-
-    const ctx = new AC();
-    let decoded;
-    try {
-      decoded = await ctx.decodeAudioData(arrayBuf);
-    } catch (e) {
-      try { ctx.close(); } catch (e2) {}
-      throw new Error(
-        'Bu medya biçimi yerleşik çözücüyle açılamadı. ' +
-        'Hızlı çözüm için ffmpeg.exe dosyasını eklentinin lib/ffmpeg/ klasörüne ekleyin.'
-      );
-    }
-    try { ctx.close(); } catch (e2) {}
-
-    const targetSR = 16000;
-    const inSR     = decoded.sampleRate;
-    const startSample = Math.max(0, Math.floor(srcStart * inSR));
-    const lenSample   = Math.min(decoded.length - startSample, Math.floor(duration * inSR));
-    if (lenSample <= 0) throw new Error('Çıkarılacak ses örneği bulunamadı.');
-
-    const chs  = decoded.numberOfChannels;
-    const mono = new Float32Array(lenSample);
-    for (let ch = 0; ch < chs; ch++) {
-      const data = decoded.getChannelData(ch);
-      for (let i = 0; i < lenSample; i++) mono[i] += (data[startSample + i] || 0) / chs;
-    }
-
-    const offline = new OfflineAudioContext(1, Math.ceil(duration * targetSR), targetSR);
-    const tmpBuf  = offline.createBuffer(1, lenSample, inSR);
-    tmpBuf.copyToChannel(mono, 0);
-    const node = offline.createBufferSource();
-    node.buffer = tmpBuf;
-    node.connect(offline.destination);
-    node.start();
-    const rendered = await offline.startRendering();
-
-    fs.writeFileSync(outWav, Buffer.from(_encodeWav(rendered.getChannelData(0), targetSR)));
-    return outWav;
-  }
 
   function _encodeWav(samples, sampleRate) {
     const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -675,7 +613,7 @@ const APIManager = (() => {
     }
   }
 
-  return { setApiKey, getApiKey, hasStoredKey, maskApiKey, transcribe, getLastWavPath, getLastWavOffset, cleanupLastWav, findFfmpeg: _findFfmpeg };
+  return { setApiKey, getApiKey, hasStoredKey, maskApiKey, transcribe, getLastWavPath, getLastWavOffset, cleanupLastWav, findFfmpeg: _findFfmpeg, encrypt: _encrypt, decrypt: _decrypt };
 })();
 
 
@@ -792,7 +730,7 @@ const TranscriptStore = (() => {
     const prev = _words[idx];
     const next = _words[idx + 1];
     const midStart = prev.end;
-    const midEnd   = next ? next.start : prev.end + 0.3;
+    const midEnd   = (next && next.start > prev.end) ? next.start : prev.end + 0.3;
     const duration = (midEnd - midStart) / 2;
     const newWord = {
       id     : _uid(),
@@ -917,26 +855,27 @@ const TranscriptStore = (() => {
 
   /** Silinecek aralıkları hesapla — komşu sessizliği de dahil eder */
   function getDeleteRanges() {
-    // Timeline'da KALAN kelimeler (hiçbir işareti olmayanlar)
     const active = _words.filter(w => !w.deleted && !w.filler && !w.repeat && !w.aiDeleted);
-    const toCut  = _words.filter(_isCut);   // bekleyen (uygulanmamış) kesimler
+    const toCut  = _words.filter(_isCut);
     const ranges = [];
 
+    let activeIdx = 0;
+
     for (const w of toCut) {
-      // Silinmiş kelimenin önceki aktif kelimesini bul
-      const prevActive = active.filter(x => x.end <= w.start).pop();
-      // Sonraki aktif kelimesini bul
-      const nextActive = active.find(x => x.start >= w.end);
+      while (activeIdx < active.length && active[activeIdx].start < w.start) {
+        activeIdx++;
+      }
+      
+      const prevActive = activeIdx > 0 ? active[activeIdx - 1] : null;
+      const nextActive = activeIdx < active.length ? active[activeIdx] : null;
 
       let start = w.start;
       let end   = w.end;
 
-      // Önceki kelime ile arasındaki boşluğu da al (sessizlik payı)
       if (prevActive) {
         const gap = w.start - prevActive.end;
-        if (gap > 0.02) start = prevActive.end + gap * 0.5; // yarısını al
+        if (gap > 0.02) start = prevActive.end + gap * 0.5;
       }
-      // Sonraki kelime ile arasındaki boşluğu da al
       if (nextActive) {
         const gap = nextActive.start - w.end;
         if (gap > 0.02) end = w.end + gap * 0.5;
@@ -945,7 +884,6 @@ const TranscriptStore = (() => {
       ranges.push({ start, end, wordId: w.id });
     }
 
-    // Bitişik aralıkları birleştir
     ranges.sort((a, b) => a.start - b.start);
     const merged = [];
     for (const r of ranges) {
@@ -1210,7 +1148,10 @@ const TranscriptEditor = (() => {
     input.addEventListener('blur',   commit);
     input.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter')  { ev.preventDefault(); commit(); }
-      if (ev.key === 'Escape') { span.textContent = old; }
+      if (ev.key === 'Escape') { 
+        input.removeEventListener('blur', commit);
+        span.textContent = old; 
+      }
     });
   }
 
@@ -1219,6 +1160,7 @@ const TranscriptEditor = (() => {
     const span = e.currentTarget;
     const id   = span.dataset.id;
     const word = span.textContent;
+    const safeWord = word.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
     _contextMenu.innerHTML = `
       <div class="menu-item" data-action="goto">
@@ -1228,7 +1170,7 @@ const TranscriptEditor = (() => {
         <span class="icon">✎</span> Düzenle
       </div>
       <div class="menu-item" data-action="replace-all">
-        <span class="icon">🔁</span> Tüm "${word}" → değiştir…
+        <span class="icon">🔁</span> Tüm "${safeWord}" → değiştir…
       </div>
       <div class="menu-item" data-action="insert-before">
         <span class="icon">+</span> Önüne kelime ekle
@@ -1616,10 +1558,18 @@ const AIEditorEngine = (() => {
   let _reasons = [];
 
   function _loadSettings() {
-    try { return JSON.parse(localStorage.getItem(_STORAGE_KEY) || '{}'); } catch (e) { return {}; }
+    try { 
+      const s = JSON.parse(localStorage.getItem(_STORAGE_KEY) || '{}'); 
+      if (s.apiKey) s.apiKey = APIManager.decrypt(s.apiKey);
+      return s;
+    } catch (e) { return {}; }
   }
   function _saveSettings(obj) {
-    try { localStorage.setItem(_STORAGE_KEY, JSON.stringify(obj)); } catch (e) {}
+    try { 
+      const toSave = { ...obj };
+      if (toSave.apiKey) toSave.apiKey = APIManager.encrypt(toSave.apiKey);
+      localStorage.setItem(_STORAGE_KEY, JSON.stringify(toSave)); 
+    } catch (e) {}
   }
 
   function initUI() {
@@ -2185,6 +2135,18 @@ const UIController = (() => {
     const transcribeBtn = document.getElementById('transcribeBtn');
     if (transcribeBtn) transcribeBtn.addEventListener('click', _onTranscribeClick);
 
+    // Kapsam seçici modal
+    document.querySelectorAll('.scope-opt').forEach(opt => {
+      opt.addEventListener('click', () => {
+        if (opt.disabled) return;
+        const scope = opt.dataset.scope;
+        _closeScopeModal();
+        _runTranscription(scope);
+      });
+    });
+    document.getElementById('scopeClose')?.addEventListener('click', _closeScopeModal);
+    document.getElementById('scopeBackdrop')?.addEventListener('click', _closeScopeModal);
+
     // Ayarlar çekmecesi
     const settingsBtn      = document.getElementById('settingsBtn');
     const settingsClose    = document.getElementById('settingsClose');
@@ -2396,15 +2358,138 @@ const UIController = (() => {
     });
   }
 
-  async function _onTranscribeClick() {
+  /* ── Transkript kapsam seçici (modal) ── */
+  function _onTranscribeClick() {
+    const cs = window.getCSInterface ? window.getCSInterface() : null;
+    if (!cs) { _runTranscription('full'); return; } // CEP yoksa (geliştirme) doğrudan
+    _openScopeModal();
+  }
+
+  function _scopeFmt(s) {
+    const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+    return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+  function _setScopeSub(id, txt) { const el = document.getElementById(id); if (el) el.textContent = txt; }
+
+  function _openScopeModal() {
+    const modal = document.getElementById('scopeModal');
+    if (!modal) { _runTranscription('full'); return; }
+
+    _setScopeSub('scopeFullSub', 'yükleniyor…');
+    _setScopeSub('scopeInoutSub', '—');
+    _setScopeSub('scopeSelectedSub', '—');
+    const tl = document.getElementById('scopeTimeline'); if (tl) tl.innerHTML = '';
+    const rl = document.getElementById('scopeRuler');    if (rl) rl.innerHTML = '';
+
+    document.getElementById('scopeBackdrop')?.classList.add('open');
+    modal.classList.add('open');
+
+    window.getCSInterface().evalScript('getSequenceOverview()', (result) => {
+      let ov;
+      try { ov = JSON.parse(result); } catch (e) { ov = { success: false, error: 'Yanıt çözümlenemedi' }; }
+      _renderScopeModal(ov);
+    });
+  }
+
+  function _renderScopeModal(ov) {
+    if (!ov || !ov.success) {
+      _setScopeSub('scopeFullSub', (ov && ov.error) ? ov.error : 'Aktif sekans yok');
+      return;
+    }
+    const nameEl = document.getElementById('scopeSeqName');
+    if (nameEl) nameEl.textContent = ov.name + ' · ' + _scopeFmt(ov.duration);
+
+    _setScopeSub('scopeFullSub', _scopeFmt(ov.duration) + ' (tüm sekans)');
+
+    const inoutBtn = document.getElementById('scopeInoutBtn');
+    if (ov.hasInOut) {
+      _setScopeSub('scopeInoutSub', `${_scopeFmt(ov.inPoint)} → ${_scopeFmt(ov.outPoint)}  (${_scopeFmt(ov.outPoint - ov.inPoint)})`);
+      if (inoutBtn) inoutBtn.disabled = false;
+    } else {
+      _setScopeSub('scopeInoutSub', 'In/Out işaretli değil');
+      if (inoutBtn) inoutBtn.disabled = true;
+    }
+
+    const selBtn = document.getElementById('scopeSelectedBtn');
+    if (ov.hasSelection) {
+      _setScopeSub('scopeSelectedSub', `${_scopeFmt(ov.selStart)} → ${_scopeFmt(ov.selEnd)}  (${_scopeFmt(ov.selEnd - ov.selStart)})`);
+      if (selBtn) selBtn.disabled = false;
+    } else {
+      _setScopeSub('scopeSelectedSub', 'Seçili klip yok');
+      if (selBtn) selBtn.disabled = true;
+    }
+
+    _drawScopeTimeline(ov);
+  }
+
+  function _drawScopeTimeline(ov) {
+    const tl = document.getElementById('scopeTimeline');
+    const ruler = document.getElementById('scopeRuler');
+    if (!tl) return;
+    tl.innerHTML = ''; if (ruler) ruler.innerHTML = '';
+
+    const dur = ov.duration || 1;
+    const pct = s => (Math.max(0, Math.min(dur, s)) / dur) * 100;
+
+    if (ruler) {
+      const steps = 4;
+      for (let i = 0; i <= steps; i++) {
+        const sp = document.createElement('span');
+        sp.style.left = (i / steps * 100) + '%';
+        sp.textContent = _scopeFmt(dur * i / steps);
+        ruler.appendChild(sp);
+      }
+    }
+
+    const tracks  = ov.tracks || [];
+    const vtracks = tracks.filter(t => t.type === 'V').reverse(); // üst V en üstte
+    const atracks = tracks.filter(t => t.type === 'A');
+    vtracks.concat(atracks).forEach(tr => {
+      const row = document.createElement('div');
+      row.className = 'scope-track';
+      (tr.clips || []).forEach(c => {
+        const clip = document.createElement('div');
+        clip.className = 'scope-clip ' + (tr.type === 'V' ? 'v' : 'a') + (c.selected ? ' selected' : '');
+        clip.style.left  = pct(c.start) + '%';
+        clip.style.width = Math.max(0.4, pct(c.end) - pct(c.start)) + '%';
+        row.appendChild(clip);
+      });
+      tl.appendChild(row);
+    });
+
+    if (ov.hasInOut) {
+      const o = document.createElement('div');
+      o.className = 'scope-ov scope-ov-inout';
+      o.style.left = pct(ov.inPoint) + '%';
+      o.style.width = (pct(ov.outPoint) - pct(ov.inPoint)) + '%';
+      tl.appendChild(o);
+    }
+    if (ov.hasSelection) {
+      const o = document.createElement('div');
+      o.className = 'scope-ov scope-ov-sel';
+      o.style.left = pct(ov.selStart) + '%';
+      o.style.width = (pct(ov.selEnd) - pct(ov.selStart)) + '%';
+      tl.appendChild(o);
+    }
+    const ph = document.createElement('div');
+    ph.className = 'scope-playhead';
+    ph.style.left = pct(ov.playhead) + '%';
+    tl.appendChild(ph);
+  }
+
+  function _closeScopeModal() {
+    document.getElementById('scopeModal')?.classList.remove('open');
+    document.getElementById('scopeBackdrop')?.classList.remove('open');
+  }
+
+  async function _runTranscription(scope) {
     const btn = document.getElementById('transcribeBtn');
-    btn.disabled = true;
+    if (btn) btn.disabled = true;
     _showLoading(true);
 
-    const useInOutOnly = document.getElementById('inOutOnly')?.checked === true;
-    const language     = document.getElementById('languageSelect')?.value || 'tr';
-
-    log(useInOutOnly ? 'Mod: Sadece In/Out aralığı' : 'Mod: Tüm sekans', 'info');
+    const language   = document.getElementById('languageSelect')?.value || 'tr';
+    const scopeLabel = scope === 'inout' ? 'In/Out' : scope === 'selected' ? 'Seçili klipler' : 'Tüm sekans';
+    log('Transkript kapsamı: ' + scopeLabel, 'info');
 
     try {
       const words = await APIManager.transcribe((pct, msg) => {
@@ -2412,7 +2497,7 @@ const UIController = (() => {
         log(msg, 'info');
         const lt = document.getElementById('loadingText');
         if (lt) lt.textContent = msg;
-      }, { useInOutOnly, language });
+      }, { scope, language });
 
       TranscriptStore.load(words);
       toast(`${words.length} kelime transkript edildi.`, 'success');
@@ -2421,14 +2506,13 @@ const UIController = (() => {
       const transcriptTab = document.querySelector('.tab[data-panel="panelTranscript"]');
       if (transcriptTab) transcriptTab.click();
 
-      // Otomatik sessizlik tarama (FFmpeg)
       await _onScanSilences();
 
     } catch (e) {
       toast('Hata: ' + e.message, 'error');
       log('Hata: ' + e.message, 'error');
     } finally {
-      btn.disabled = false;
+      if (btn) btn.disabled = false;
       _showLoading(false);
     }
   }
@@ -2630,7 +2714,7 @@ const UIController = (() => {
   async function _onRunAiClean() {
     const btn = document.getElementById('runAiCleanBtn');
     const statusBar = document.getElementById('aiStatusBar');
-    btn.disabled = true;
+    if (btn) btn.disabled = true;
     _showLoading(true);
 
     const setStatus = msg => { if (statusBar) statusBar.textContent = msg; };
@@ -2660,10 +2744,12 @@ const UIController = (() => {
 
           const wordEl = TranscriptStore.getWords(true).find(w => String(w.id) === String(r.id));
           const wordText = wordEl ? wordEl.word : '(?)';
+          const safeWordText = wordText.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+          const safeText = (r.text||'').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
           item.innerHTML = `
-            <div class="ai-reason-word">"${wordText}"</div>
-            <div class="ai-reason-text">${r.text}</div>
+            <div class="ai-reason-word">"${safeWordText}"</div>
+            <div class="ai-reason-text">${safeText}</div>
             <button class="ai-reason-restore" data-id="${r.id}">Koru</button>`;
 
           item.querySelector('.ai-reason-restore').addEventListener('click', (e) => {
@@ -2689,14 +2775,14 @@ const UIController = (() => {
       toast('AI Hata: ' + e.message, 'error');
       log('AI Hata: ' + e.message, 'error');
     } finally {
-      btn.disabled = false;
+      if (btn) btn.disabled = false;
       _showLoading(false);
     }
   }
 
   async function _onInjectTimeline() {
     const btn = document.getElementById('injectTimelineBtn');
-    btn.disabled = true;
+    if (btn) btn.disabled = true;
     _showLoading(true);
     try {
       const result = await SubtitleEngine.injectToTimeline();
@@ -2714,14 +2800,14 @@ const UIController = (() => {
       toast('Hata: ' + e.message, 'error');
       log('Hata: ' + e.message, 'error');
     } finally {
-      btn.disabled = false;
+      if (btn) btn.disabled = false;
       _showLoading(false);
     }
   }
 
   async function _onGenerateSubtitles() {
     const btn = document.getElementById('generateSubtitlesBtn');
-    btn.disabled = true;
+    if (btn) btn.disabled = true;
     _showLoading(true);
 
     try {
@@ -2747,7 +2833,7 @@ const UIController = (() => {
       toast('Hata: ' + e.message, 'error');
       log('Hata: ' + e.message, 'error');
     } finally {
-      btn.disabled = false;
+      if (btn) btn.disabled = false;
       _showLoading(false);
     }
   }
@@ -2999,7 +3085,7 @@ const UIController = (() => {
   function _fmt(sec) {
     const m = Math.floor(sec / 60);
     const s = Math.floor(sec % 60);
-    return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+    return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   }
 
   return { init, updateStats, toggleSilenceQueue, isSilenceQueued, log, toast };
@@ -3008,4 +3094,47 @@ const UIController = (() => {
 /* ── DOM Hazır ── */
 document.addEventListener('DOMContentLoaded', () => {
   UIController.init();
+
+  // Inline event handlers moved here
+  const btnSelectAll = document.getElementById('btnSelectAll');
+  if(btnSelectAll) btnSelectAll.addEventListener('click', () => document.querySelectorAll('.word').forEach(w=>w.classList.add('selected')));
+
+  const btnClearSel = document.getElementById('btnClearSelect');
+  if(btnClearSel) btnClearSel.addEventListener('click', () => document.querySelectorAll('.word').forEach(w=>w.classList.remove('selected')));
+
+  const btnCopy = document.getElementById('btnCopyText');
+  if(btnCopy) btnCopy.addEventListener('click', () => {
+    const t=Array.from(document.querySelectorAll('.word')).map(w=>w.textContent).join(' ');
+    navigator.clipboard.writeText(t); 
+    if(typeof UIController !== 'undefined') UIController.toast('Panoya kopyalandı.','success');
+  });
+
+  const posX = document.getElementById('positionXInput');
+  if(posX) posX.addEventListener('input', function() { const el = document.getElementById('posXLabel'); if(el) el.textContent=this.value; });
+
+  const posY = document.getElementById('positionYInput');
+  if(posY) posY.addEventListener('input', function() { const el = document.getElementById('posYLabel'); if(el) el.textContent=this.value; });
+
+  const bgOp = document.getElementById('bgOpacityInput');
+  if(bgOp) bgOp.addEventListener('input', function() { const el = document.getElementById('bgOpacityLabel'); if(el) el.textContent=this.value; });
+
+  const refreshSeqBtn = document.getElementById('refreshSeqBtn');
+  if(refreshSeqBtn) refreshSeqBtn.addEventListener('click', () => {
+    const cs=window.getCSInterface&&window.getCSInterface();
+    if(cs){
+      cs.evalScript('getSequenceInfo()', r=>{
+        try{
+          const d=JSON.parse(r);
+          const el = document.getElementById('seqInfo');
+          if(el) el.textContent=d.success?d.name+' — '+d.videoTracks+'V / '+d.audioTracks+'A — '+d.duration.toFixed(1)+'s':'Sekans yok';
+        }catch(e){
+          const el = document.getElementById('seqInfo');
+          if(el) el.textContent='Hata';
+        }
+      });
+    } else {
+      const el = document.getElementById('seqInfo');
+      if(el) el.textContent='CEP yok (geliştirme)';
+    }
+  });
 });

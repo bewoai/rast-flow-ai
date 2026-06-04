@@ -30,7 +30,9 @@ if (typeof JSON.stringify !== "function") {
                                                .replace(/"/g, '\\"')
                                                .replace(/\n/g, "\\n")
                                                .replace(/\r/g, "\\r")
-                                               .replace(/\t/g, "\\t") + '"';
+                                               .replace(/\t/g, "\\t")
+                                               .replace(/\b/g, "\\b")
+                                               .replace(/\f/g, "\\f") + '"';
     if (type === "object") {
       if (value instanceof Array) {
         var arrParts = [];
@@ -206,24 +208,29 @@ function _firstSelectedClip(seq, rStart, rEnd) {
    Timeline parçalara bölünmüş olsa bile aralığın tamamını kapsar.
    ══════════════════════════════════════════════════════════════════ */
 
-function getTimelineAudioSegments(useInOutOnly) {
+function getTimelineAudioSegments(scope) {
   try {
-    if (typeof useInOutOnly === "string") {
-      useInOutOnly = (useInOutOnly === "true" || useInOutOnly === "1");
-    }
+    // Geriye dönük uyumluluk: eski boolean/string parametre → scope
+    if (scope === true || scope === "true" || scope === "1") scope = "inout";
+    if (scope === false || scope === "false" || scope === "0" || !scope) scope = "full";
+
     var seq = app.project.activeSequence;
     if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans bulunamadı." });
 
-    var rStart, rEnd, mode;
-    if (useInOutOnly) {
+    var rStart, rEnd, mode = scope;
+    if (scope === "inout") {
       var inS  = _toSeconds(seq.getInPoint());
       var outS = _toSeconds(seq.getOutPoint());
       if (!((outS > inS) && (outS > 0))) {
-        return JSON.stringify({ success: false, error: "Timeline'da geçerli In/Out aralığı yok. I ve O ile aralık işaretleyin veya 'Sadece In/Out aralığı'nı kapatın." });
+        return JSON.stringify({ success: false, error: "Timeline'da geçerli In/Out aralığı yok. I ve O ile aralık işaretleyin." });
       }
-      rStart = inS; rEnd = outS; mode = "inout";
+      rStart = inS; rEnd = outS;
+    } else if (scope === "selected") {
+      var rng = _selectedClipsRange(seq);
+      if (!rng) return JSON.stringify({ success: false, error: "Seçili klip yok. Timeline'da en az bir klip seçin." });
+      rStart = rng.start; rEnd = rng.end;
     } else {
-      rStart = 0; rEnd = _toSeconds(seq.end); mode = "full";
+      rStart = 0; rEnd = _toSeconds(seq.end);
     }
     if (rEnd <= rStart) return JSON.stringify({ success: false, error: "Geçerli bir aralık hesaplanamadı." });
 
@@ -297,6 +304,85 @@ function _audioTrackForRange(seq, rStart, rEnd) {
   return -1;
 }
 
+/** Seçili tüm kliplerin kapsadığı zaman aralığı (video+audio). */
+function _selectedClipsRange(seq) {
+  var s = null, e = null;
+  function scan(tracks) {
+    for (var t = 0; t < tracks.numTracks; t++) {
+      var tr = tracks[t];
+      for (var c = 0; c < tr.clips.numItems; c++) {
+        var cl = tr.clips[c];
+        try {
+          if (cl.isSelected && cl.isSelected()) {
+            var a = _toSeconds(cl.start), b = _toSeconds(cl.end);
+            if (s === null || a < s) s = a;
+            if (e === null || b > e) e = b;
+          }
+        } catch (x) {}
+      }
+    }
+  }
+  scan(seq.videoTracks);
+  scan(seq.audioTracks);
+  if (s === null) return null;
+  return { start: s, end: e };
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   2c. getSequenceOverview() — Mini-timeline çizimi için sekans verisi
+   ══════════════════════════════════════════════════════════════════ */
+
+function getSequenceOverview() {
+  try {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans bulunamadı." });
+
+    var dur  = _toSeconds(seq.end);
+    var inS  = _toSeconds(seq.getInPoint());
+    var outS = _toSeconds(seq.getOutPoint());
+    var hasInOut = (outS > inS && outS > 0);
+
+    var playhead = 0;
+    try { playhead = _toSeconds(seq.getPlayerPosition()); } catch (e) {}
+
+    var tracks = [];
+    function gather(trackList, type) {
+      for (var t = 0; t < trackList.numTracks; t++) {
+        var tr = trackList[t];
+        var clips = [];
+        for (var c = 0; c < tr.clips.numItems; c++) {
+          var cl = tr.clips[c];
+          var sel = false;
+          try { sel = !!(cl.isSelected && cl.isSelected()); } catch (e2) {}
+          clips.push({ start: _toSeconds(cl.start), end: _toSeconds(cl.end), selected: sel });
+        }
+        tracks.push({ type: type, index: t, clips: clips });
+      }
+    }
+    gather(seq.videoTracks, "V");
+    gather(seq.audioTracks, "A");
+
+    var sel = _selectedClipsRange(seq);
+
+    return JSON.stringify({
+      success     : true,
+      name        : seq.name,
+      duration    : dur,
+      hasInOut    : hasInOut,
+      inPoint     : hasInOut ? inS  : 0,
+      outPoint    : hasInOut ? outS : 0,
+      playhead    : playhead,
+      hasSelection: !!sel,
+      selStart    : sel ? sel.start : 0,
+      selEnd      : sel ? sel.end   : 0,
+      tracks      : tracks
+    });
+
+  } catch (e) {
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
 /* ══════════════════════════════════════════════════════════════════
    3. getSequenceInfo()
    ══════════════════════════════════════════════════════════════════ */
@@ -341,6 +427,7 @@ function rippleDeleteRanges(rangesJSON, ripple) {
 
     var seq = app.project.activeSequence;
     if (!seq) {
+      app.userInputDisabled = false;
       return JSON.stringify({ success: false, error: "Aktif sekans bulunamadı." });
     }
 
@@ -348,11 +435,13 @@ function rippleDeleteRanges(rangesJSON, ripple) {
       try { app.enableQE(); } catch (e) {}
     }
     if (typeof qe === "undefined") {
+      app.userInputDisabled = false;
       return JSON.stringify({ success: false, error: "QE DOM etkinleştirilemedi." });
     }
 
     var qeSeq = qe.project.getActiveSequence();
     if (!qeSeq) {
+      app.userInputDisabled = false;
       return JSON.stringify({ success: false, error: "QE aktif sekans alınamadı." });
     }
 
@@ -471,55 +560,20 @@ function generateAndImportSRT(segmentsJSON, savePathHint) {
       return JSON.stringify({ success: false, error: "Segment verisi boş." });
     }
 
-    var srtContent = "";
-    for (var i = 0; i < segments.length; i++) {
-      var seg = segments[i];
-      var startTC = _secsToSRTTime(parseFloat(seg.start));
-      var endTC   = _secsToSRTTime(parseFloat(seg.end));
-      srtContent += (i + 1) + "\r\n";
-      srtContent += startTC + " --> " + endTC + "\r\n";
-      srtContent += (seg.text || "") + "\r\n\r\n";
+    var srtResult = _writeSRT(segments, "rastflow_altyazi_");
+    if (!srtResult || !srtResult.fsName) {
+      return JSON.stringify({ success: false, error: "SRT dosyası yazılamadı." });
     }
-
-    var baseName = "rastflow_altyazi_" + new Date().getTime() + ".srt";
-    var srtPath;
-
-    if (savePathHint && savePathHint.length > 0) {
-      srtPath = savePathHint + "/" + baseName;
-    } else {
-      srtPath = Folder.temp.absoluteURI + "/" + baseName;
-    }
-
-    try {
-      var projFile = app.project.path;
-      if (projFile && projFile.length > 0) {
-        var projFolder = new File(projFile).parent.absoluteURI;
-        srtPath = projFolder + "/" + baseName;
-      }
-    } catch (e) {}
-
-    var srtFile = new File(srtPath);
-    srtFile.encoding = "UTF-8";
-    if (!srtFile.open("w")) {
-      srtPath = Folder.temp.absoluteURI + "/" + baseName;
-      srtFile = new File(srtPath);
-      srtFile.encoding = "UTF-8";
-      srtFile.open("w");
-    }
-    srtFile.write(srtContent);
-    srtFile.close();
-
-    var fsPath = srtFile.fsName;
 
     var importedToProject = false;
     try {
-      app.project.importFiles([fsPath], true, app.project.rootItem, false);
+      app.project.importFiles([srtResult.fsName], true, app.project.rootItem, false);
       importedToProject = true;
     } catch (importErr) {}
 
     return JSON.stringify({
       success          : true,
-      srtPath          : fsPath,
+      srtPath          : srtResult.fsName,
       importedToProject: importedToProject
     });
 
@@ -627,7 +681,9 @@ function _writeSRT(segments, prefix) {
   if (!srtFile.open("w")) {
     srtFile = new File(Folder.temp.absoluteURI + "/" + baseName);
     srtFile.encoding = "UTF-8";
-    srtFile.open("w");
+    if (!srtFile.open("w")) {
+      throw new Error("SRT dosyası yazılamadı: İzin reddedildi.");
+    }
   }
   srtFile.write(srtContent);
   srtFile.close();
@@ -729,6 +785,7 @@ function createSubtitleGraphicClips(segmentsJSON, styleParamsJSON) {
               textDoc.backgroundEnabled = false;
             }
 
+            textDoc.text = seg.text || "";
             textProp.setValue(textDoc);
           }
         } catch (textErr) { /* TextDocument API mevcut değilse sessizce devam et */ }
@@ -770,8 +827,11 @@ function addKeyframesToLayer(paramsJSON) {
   try {
     var p    = JSON.parse(paramsJSON);
     var seq  = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans yok." });
     var track = seq.videoTracks[p.trackIndex];
+    if (!track) return JSON.stringify({ success: false, error: "Track yok." });
     var clip  = track.clips[p.clipIndex];
+    if (!clip) return JSON.stringify({ success: false, error: "Klip yok." });
 
     var prop = clip.getComponentParam("Motion", p.property);
     if (!prop) {
