@@ -23,26 +23,13 @@ const APIManager = (() => {
   let _lastWavPath = '';
   let _lastWavOffset = 0;
 
-  /** Cihaza özgü AES-256 şifreleme anahtarı üret */
+  /** Cihaza özgü AES-256 şifreleme anahtarı üret (hostname + kullanıcı türevli) */
   function _getDeviceKey() {
     try {
       const crypto = require('crypto');
-      const fs = require('fs');
-      const path = require('path');
-      const os = require('os');
-      const secretFile = path.join(os.homedir(), '.rastflowai', '.secret.key');
-      let secret;
-      if (fs.existsSync(secretFile)) {
-        secret = fs.readFileSync(secretFile, 'utf8');
-      } else {
-        secret = crypto.randomBytes(32).toString('hex');
-        try {
-          const dir = path.dirname(secretFile);
-          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-          fs.writeFileSync(secretFile, secret, { mode: 0o600 });
-        } catch(e){}
-      }
-      return crypto.createHash('sha256').update(secret).digest();
+      const os     = require('os');
+      const seed   = 'rastflowai-v1-' + os.hostname() + '-' + (os.userInfo ? os.userInfo().username : 'usr');
+      return crypto.createHash('sha256').update(seed).digest();
     } catch (e) { return null; }
   }
 
@@ -705,6 +692,43 @@ const TranscriptStore = (() => {
     return count;
   }
 
+  /**
+   * AI düzeltmesi uygula: [{id, word}]. Boş word ("") → kelime önceki kelimeye
+   * birleştirilir (süresi aktarılır, kendisi silinir). Tek undo + tek render.
+   * @returns {{updated:number, removed:number}}
+   */
+  function applyCorrections(items) {
+    if (!items || !items.length) return { updated: 0, removed: 0 };
+    pushUndo();
+
+    const byId = {};
+    items.forEach(it => { if (it && it.id !== undefined) byId[String(it.id)] = it.word; });
+
+    let updated = 0;
+    const removeSet = new Set();
+    let lastKept = null;
+
+    _words.forEach(w => {
+      const t = byId[String(w.id)];
+      if (t === undefined || typeof t !== 'string') { lastKept = w; return; }
+      if (t.trim() === '') {
+        // Birleşme: süreyi önceki kalan kelimeye genişlet, bu kelimeyi sil
+        if (lastKept) lastKept.end = Math.max(lastKept.end, w.end);
+        removeSet.add(w.id);
+      } else {
+        if (t.trim() !== w.word) { w.word = t.trim(); updated++; }
+        lastKept = w;
+      }
+    });
+
+    if (removeSet.size) {
+      _words    = _words.filter(w => !removeSet.has(w.id));
+      _segments = _segments.filter(s => !removeSet.has(s.afterWordId));
+    }
+    if (updated || removeSet.size) _notify();
+    return { updated, removed: removeSet.size };
+  }
+
   function deleteWord(id) {
     const w = _words.find(x => x.id === id);
     if (w && !w.deleted) { pushUndo([id]); w.deleted = true; _notify(); }
@@ -906,7 +930,7 @@ const TranscriptStore = (() => {
   return {
     load, getWords, getSegments, updateWord, deleteWord, restoreWord,
     markFiller, markRepeat, insertWordAfter, insertWordBefore, removeWord, moveWord,
-    replaceAll, applyWordTexts, splitWord,
+    replaceAll, applyWordTexts, applyCorrections, splitWord,
     addSegmentBreak, removeSegmentBreak, setSegmentBreaks,
     getSegmentedWords, getDeleteRanges,
     markAppliedCuts,
@@ -1729,17 +1753,24 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
       : (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content);
   }
 
-  const PUNCT_PROMPT = `Sen bir Türkçe metin editörüsün. Sana sırayla kelimeler [{id, word}] verilecek.
-Görevin: Türkçe dil bilgisine uygun noktalama işaretlerini (. , ? ! : ; …) eklemek ve cümle başlarını ile özel adları büyük harfle düzeltmek.
+  const ENHANCE_PROMPT = `Sen uzman bir Türkçe transkript editörüsün ve özellikle TIBBİ/teknik içeriklerde uzmansın. Sana bir konuşmanın ham Whisper transkripti, sıralı kelimeler [{id, word}] olarak verilecek.
 
-KESİN KURALLAR:
-- Kelime EKLEME, SİLME, BİRLEŞTİRME veya SIRASINI DEĞİŞTİRME. Sadece her kelimenin yazımını düzelt.
-- Noktalama işaretini ait olduğu kelimeye bitişik yaz (örn. "evet," / "tamam." / "gidelim").
-- Soru cümlelerinde "mı/mi/mu/mü" veya soru sözcüğü varsa cümle sonuna "?" koy.
-- Gönderilen id'leri ve kelime SAYISINI birebir koru.
+Her kelimeyi DÜZELT:
+1) NOKTALAMA: Türkçe kurallarına uygun . , ? ! : ; … ekle; işareti ait olduğu kelimeye bitişik yaz. Soru ("mı/mi/mu/mü" veya soru sözcüğü) varsa "?" koy.
+2) YAZIM & BÜYÜK HARF: Türkçe imla hatalarını düzelt, Türkçe karakterleri (ç ğ ı İ ö ş ü) doğru kullan, cümle başlarını ve özel adları büyük harfle başlat.
+3) TIBBİ/TEKNİK TERİMLER: Yanlış duyulmuş tıbbi/teknik terimleri doğru ve yaygın yazımıyla düzelt; uluslararası kısaltma ve terimleri doğru biçimde (genelde İngilizce/Latince) yaz. Örnekler:
+   - "pikos" / "pe ce o es" → "PCOS"
+   - "em ar" → "MR", "be te" → "BT", "u es ge" → "USG", "te se ha" → "TSH", "ef es ha" → "FSH", "ha ce ge" → "hCG"
+   - hormon/ilaç/anatomi adlarını doğru yaz (örn. "östrojen", "progesteron", "endometrium").
+   Terimi YALNIZCA bağlam gerçekten tıbbi/teknik olduğunda değiştir; günlük kelimeleri zorlama.
+
+KURALLAR:
+- Anlamı KORU. Kelime ekleme veya sırasını değiştirme YOK. Mevcut anlamı bozma.
+- Bir terim birden fazla kelimeden tek terime İNİYORSA (örn. "poli kistik over sendromu" → "PCOS"): düzeltilmiş tam terimi DİZİDEKİ İLK kelimeye yaz, birleşen diğer kelimeler için word'ü "" (boş dize) döndür.
+- Gönderilen id'leri AYNEN koru (string olarak, değiştirme).
 
 SADECE şu JSON ile yanıt ver, başka açıklama yazma:
-{"words":[{"id":"<id>","word":"<düzeltilmiş kelime>"}]}`;
+{"words":[{"id":"<id>","word":"<düzeltilmiş kelime ya da '' (birleşme)>"}]}`;
 
   /** AI Editör anahtarı yoksa Whisper (OpenAI) anahtarına düş. */
   function _resolveKeyModel() {
@@ -1754,21 +1785,21 @@ SADECE şu JSON ile yanıt ver, başka açıklama yazma:
     return { apiKey, model, isAnthropic: model.indexOf('claude') === 0 };
   }
 
-  async function addPunctuationWithAI(onStatus) {
+  async function enhanceTranscriptWithAI(onStatus) {
     const { apiKey, model, isAnthropic } = _resolveKeyModel();
     if (!apiKey) throw new Error('API anahtarı yok. Ayarlar (OpenAI) veya AI Editör sekmesinden girin.');
 
     const words = TranscriptStore.getWords().map(w => ({ id: w.id, word: w.word }));
     if (!words.length) throw new Error('Transkript boş.');
 
-    onStatus && onStatus('Noktalama için AI\'ya gönderiliyor…');
+    onStatus && onStatus('AI ile düzeltiliyor (noktalama, imla, terimler)…');
     const userContent = 'Kelimeler (JSON):\n' + JSON.stringify(words);
 
     let responseText;
     if (typeof require === 'function') {
-      responseText = await _callApiNode(apiKey, model, isAnthropic, PUNCT_PROMPT, userContent, onStatus);
+      responseText = await _callApiNode(apiKey, model, isAnthropic, ENHANCE_PROMPT, userContent, onStatus);
     } else {
-      responseText = await _callApiFetch(apiKey, model, isAnthropic, PUNCT_PROMPT, userContent, onStatus);
+      responseText = await _callApiFetch(apiKey, model, isAnthropic, ENHANCE_PROMPT, userContent, onStatus);
     }
 
     let parsed;
@@ -1779,13 +1810,12 @@ SADECE şu JSON ile yanıt ver, başka açıklama yazma:
       throw new Error('AI yanıtı çözümlenemedi: ' + String(responseText).slice(0, 200));
     }
     const items = parsed.words || parsed.items || [];
-    const count = TranscriptStore.applyWordTexts(items);
-    return { count };
+    return TranscriptStore.applyCorrections(items);   // { updated, removed }
   }
 
   function getReasons() { return _reasons; }
 
-  return { initUI, cleanTranscriptWithAI, addPunctuationWithAI, getReasons };
+  return { initUI, cleanTranscriptWithAI, enhanceTranscriptWithAI, getReasons };
 })();
 
 
@@ -2215,8 +2245,8 @@ const UIController = (() => {
     });
 
     // AI Türkçe noktalama
-    const punctuateBtn = document.getElementById('punctuateBtn');
-    if (punctuateBtn) punctuateBtn.addEventListener('click', _onPunctuate);
+    const smartCleanBtn = document.getElementById('smartCleanBtn');
+    if (smartCleanBtn) smartCleanBtn.addEventListener('click', _onSmartClean);
 
     // Bul & Değiştir
     const frToggle = document.getElementById('findReplaceToggle');
@@ -2643,19 +2673,24 @@ const UIController = (() => {
       : 'Filler kelime bulunamadı.', count > 0 ? 'warn' : 'info');
   }
 
-  async function _onPunctuate() {
-    const btn = document.getElementById('punctuateBtn');
+  // Tek tuş: AI ile düzelt (noktalama + imla + tıbbi/teknik terimler) → cümle cümle böl
+  async function _onSmartClean() {
+    const btn = document.getElementById('smartCleanBtn');
     if (TranscriptStore.getWords().length === 0) { toast('Önce transkript oluşturun.', 'warn'); return; }
     if (btn) btn.disabled = true;
     _showLoading(true);
     try {
       const lt = document.getElementById('loadingText');
-      const { count } = await AIEditorEngine.addPunctuationWithAI((msg) => { if (lt) lt.textContent = msg; });
-      toast(`Türkçe noktalama eklendi (${count} kelime güncellendi).`, 'success');
-      log('AI noktalama tamamlandı: ' + count + ' kelime.', 'success');
+      const { updated, removed } = await AIEditorEngine.enhanceTranscriptWithAI((msg) => { if (lt) lt.textContent = msg; });
+
+      if (lt) lt.textContent = 'Cümle cümle bölünüyor…';
+      const n = SubtitleEngine.autoSegmentSubtitles();
+
+      toast(`AI düzeltme tamam: ${updated} kelime düzeltildi${removed ? ', ' + removed + ' birleştirildi' : ''} · ${n + 1} bloğa bölündü.`, 'success');
+      log(`AI Düzelt: ${updated} güncellendi, ${removed} birleştirildi, ${n} kesim noktası.`, 'success');
     } catch (e) {
-      toast('Noktalama hatası: ' + e.message, 'error');
-      log('Noktalama hatası: ' + e.message, 'error');
+      toast('AI Düzelt hatası: ' + e.message, 'error');
+      log('AI Düzelt hatası: ' + e.message, 'error');
     } finally {
       if (btn) btn.disabled = false;
       _showLoading(false);
