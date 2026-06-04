@@ -115,7 +115,12 @@ function getPrimarySourceForRange(useInOutOnly) {
     var rs = Math.max(rStart, clipStart);
     var re = Math.min(rEnd, clipEnd);
     if (re <= rs) {
-      return JSON.stringify({ success: false, error: "Geçerli bir ses aralığı hesaplanamadı." });
+      return JSON.stringify({
+        success: false,
+        error  : "Klip seçili aralıkla örtüşmüyor — klip: " + clipStart.toFixed(2) + "–" + clipEnd.toFixed(2) +
+                 "s, istenen: " + rStart.toFixed(2) + "–" + rEnd.toFixed(2) +
+                 "s. (In/Out aralığını kontrol edin ya da Ayarlar'dan 'Sadece In/Out aralığı'nı kapatın.)"
+      });
     }
 
     var srcStart = clipIn + (rs - clipStart);
@@ -137,14 +142,21 @@ function getPrimarySourceForRange(useInOutOnly) {
 
 function _toSeconds(val) {
   if (val === null || val === undefined) return 0;
-  if (typeof val === "object" && val.seconds !== undefined) return parseFloat(val.seconds);
-  if (typeof val === "object" && val.ticks   !== undefined) return parseFloat(val.ticks) / 254016000000;
+  if (typeof val === "object") {
+    if (val.seconds !== undefined) return parseFloat(val.seconds);
+    if (val.ticks   !== undefined) return parseFloat(val.ticks) / 254016000000;
+  }
   var n = parseFloat(val);
-  return isNaN(n) ? 0 : n;
+  if (isNaN(n)) return 0;
+  // Heuristik: getInPoint/getOutPoint/seq.end bazı Premiere sürümlerinde ticks (string)
+  // döndürür. 1e7 saniye = ~115 gün; bu kadar büyük değer saniye olamaz → ticks'tir.
+  if (n > 1e7) return n / 254016000000;
+  return n;
 }
 
 function _findPrimaryClip(seq, rStart, rEnd) {
-  var sel = _firstSelectedClip(seq);
+  // Önce: istenen aralıkla ÖRTÜŞEN seçili klip
+  var sel = _firstSelectedClip(seq, rStart, rEnd);
   if (sel) return sel;
 
   var best = null, bestStart = 1e15;
@@ -168,13 +180,20 @@ function _findPrimaryClip(seq, rStart, rEnd) {
   return best;
 }
 
-function _firstSelectedClip(seq) {
+function _firstSelectedClip(seq, rStart, rEnd) {
+  function overlaps(cl) {
+    if (rStart === undefined || rEnd === undefined) return true;
+    var s = _toSeconds(cl.start), e = _toSeconds(cl.end);
+    return s < rEnd && e > rStart;
+  }
   function scan(tracks) {
     for (var t = 0; t < tracks.numTracks; t++) {
       var tr = tracks[t];
       for (var c = 0; c < tr.clips.numItems; c++) {
         var cl = tr.clips[c];
-        try { if (cl.isSelected && cl.isSelected() && cl.projectItem) return cl; } catch (e) {}
+        try {
+          if (cl.isSelected && cl.isSelected() && cl.projectItem && overlaps(cl)) return cl;
+        } catch (e) {}
       }
     }
     return null;
@@ -421,6 +440,120 @@ function _secsToSRTTime(secs) {
   function p2(n) { return n < 10 ? "0" + n : String(n); }
   function p3(n) { return n < 10 ? "00" + n : (n < 100 ? "0" + n : String(n)); }
   return p2(h) + ":" + p2(m) + ":" + p2(s) + "," + p3(ms);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   5b. createCaptionTrackFromSegments() — Native Caption Track
+   SRT üret → projeye aktar → timeline'a caption track olarak yerleştir
+   ══════════════════════════════════════════════════════════════════ */
+
+function createCaptionTrackFromSegments(segmentsJSON) {
+  try {
+    var segments = JSON.parse(segmentsJSON);
+    if (!segments || segments.length === 0) {
+      return JSON.stringify({ success: false, error: "Segment verisi boş." });
+    }
+
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans bulunamadı." });
+
+    // 1) SRT dosyasını yaz
+    var written = _writeSRT(segments, "rastflow_captions_");
+    var fsName  = written.fsName;
+
+    // 2) Caption öğesi olarak projeye aktar
+    var captionItem = null;
+    try {
+      app.project.importFiles([fsName], true, app.project.rootItem, false);
+      captionItem = _findImportedItem(written.baseName);
+    } catch (impErr) {
+      return JSON.stringify({ success: false, error: "SRT içe aktarılamadı: " + impErr.message, srtPath: fsName });
+    }
+
+    if (!captionItem) {
+      return JSON.stringify({
+        success: true, placedOnTimeline: false, srtPath: fsName, segmentCount: segments.length,
+        note: "SRT projeye aktarıldı ama öğe bulunamadı — Proje panelinden caption track'e sürükleyin."
+      });
+    }
+
+    // 3) Timeline'a caption track olarak yerleştir (best-effort, çoklu deneme)
+    app.userInputDisabled = true;
+    var placed = false;
+    var tObj = new Time(); tObj.seconds = 0;
+
+    var attempts = [
+      function () { seq.insertClip(captionItem, tObj, 0, 0); },
+      function () { seq.insertClip(captionItem, tObj); },
+      function () { seq.overwriteClip(captionItem, tObj); },
+      function () { seq.overwriteClip(captionItem, "0"); }
+    ];
+    for (var ai = 0; ai < attempts.length && !placed; ai++) {
+      try { attempts[ai](); placed = true; } catch (eAtt) {}
+    }
+    app.userInputDisabled = false;
+
+    return JSON.stringify({
+      success         : true,
+      placedOnTimeline: placed,
+      srtPath         : fsName,
+      segmentCount    : segments.length,
+      note            : placed ? "" : "Otomatik yerleştirme bu Premiere sürümünde çalışmadı — SRT Proje panelinde, caption track'e sürükleyin."
+    });
+
+  } catch (e) {
+    try { app.userInputDisabled = false; } catch (e2) {}
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/** SRT içeriğini üretip dosyaya yazar (proje klasörü, olmazsa temp). */
+function _writeSRT(segments, prefix) {
+  var srtContent = "";
+  for (var i = 0; i < segments.length; i++) {
+    var seg = segments[i];
+    srtContent += (i + 1) + "\r\n";
+    srtContent += _secsToSRTTime(parseFloat(seg.start)) + " --> " + _secsToSRTTime(parseFloat(seg.end)) + "\r\n";
+    srtContent += (seg.text || "") + "\r\n\r\n";
+  }
+
+  var baseName = prefix + new Date().getTime() + ".srt";
+  var srtPath  = Folder.temp.absoluteURI + "/" + baseName;
+  try {
+    var projFile = app.project.path;
+    if (projFile && projFile.length > 0) {
+      srtPath = new File(projFile).parent.absoluteURI + "/" + baseName;
+    }
+  } catch (e) {}
+
+  var srtFile = new File(srtPath);
+  srtFile.encoding = "UTF-8";
+  if (!srtFile.open("w")) {
+    srtFile = new File(Folder.temp.absoluteURI + "/" + baseName);
+    srtFile.encoding = "UTF-8";
+    srtFile.open("w");
+  }
+  srtFile.write(srtContent);
+  srtFile.close();
+
+  return { file: srtFile, baseName: baseName, fsName: srtFile.fsName };
+}
+
+/** İçe aktarılan SRT öğesini proje kökünde isimden bulur (uzantı strip edilmiş olabilir). */
+function _findImportedItem(baseName) {
+  try {
+    var root = app.project.rootItem;
+    var nameNoExt = baseName.replace(/\.[^.]+$/, "");
+    for (var i = root.children.numItems - 1; i >= 0; i--) {
+      var it = root.children[i];
+      try {
+        if (it && it.name && (it.name === baseName || it.name === nameNoExt || it.name.indexOf(nameNoExt) >= 0)) {
+          return it;
+        }
+      } catch (e) {}
+    }
+  } catch (e2) {}
+  return null;
 }
 
 /* ══════════════════════════════════════════════════════════════════

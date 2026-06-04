@@ -143,12 +143,6 @@
             <label class="toggle"><input type="checkbox" id="rippleDeleteToggle" checked><span class="toggle-slider"></span></label>
           </div>
         </div>
-        <div class="field">
-          <div class="toggle-row">
-            <span class="toggle-label">Tüm kanalları etkile</span>
-            <label class="toggle"><input type="checkbox" id="allTracksToggle" checked><span class="toggle-slider"></span></label>
-          </div>
-        </div>
         <button class="btn btn-danger btn-full" id="applyDeleteBtn" style="margin-top:6px;">✂ Kesimi Uygula</button>
         <div class="hint">Geri almak için Premiere'de Ctrl+Z.</div>
       </div>
@@ -349,15 +343,12 @@
 
       <!-- Dışa Aktarma Butonları -->
       <div class="btn-group" style="margin-bottom:8px;">
-        <button class="btn btn-primary btn-full" id="injectTimelineBtn" style="flex:1.2;">✦ Timeline'a Ekle</button>
+        <button class="btn btn-primary btn-full" id="injectTimelineBtn" style="flex:1.2;">✦ Caption Track'e Ekle</button>
         <button class="btn btn-success btn-full" id="generateSubtitlesBtn" style="flex:1;">📄 SRT İndir</button>
       </div>
       <div class="hint" style="text-align:center;">
-        <b>Timeline'a Ekle</b>: Premiere'de Essential Graphics klipleri oluşturur.<br>
+        <b>Caption Track'e Ekle</b>: Premiere timeline'ında native altyazı (caption) track'i oluşturur.<br>
         <b>SRT İndir</b>: Harici .srt dosyası üretir.
-      </div>
-      <div class="hint" style="text-align:center;margin-top:8px;">
-        SRT dosyası oluşturur → Premiere projesine otomatik aktarır
       </div>
 
       <!-- SRT Dosya Yolu (oluşturulduktan sonra görünür) -->

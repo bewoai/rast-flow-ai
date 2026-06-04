@@ -1296,8 +1296,10 @@ ASLA SİLME (bunlar anlam taşır):
 - Tek başına geçen, bağlam içinde anlamlı normal kelimeler.
 
 Kararsız kaldığında SİLME — kelimeyi koru. Az silmek çok silmekten iyidir.
+
+ID'ler sana gönderilen string değerlerdir (örn. "k3j9fa2"); onları AYNEN, değiştirmeden döndür (sayıya çevirme).
 SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
-{"deleted_word_ids":[<id sayıları>],"reasons":[{"id":<id>,"text":"<kısa sebep: Dolgu | Kekemelik | Hatalı Çekim>"}]}`;
+{"deleted_word_ids":["<silinecek kelimenin id'si>"],"reasons":[{"id":"<id>","text":"<kısa sebep: Dolgu | Kekemelik | Hatalı Çekim>"}]}`;
 
   async function cleanTranscriptWithAI(onStatus) {
     const settings = _loadSettings();
@@ -1437,11 +1439,14 @@ const SubtitleEngine = (() => {
     strokeWidth      : 2,
     strokeColor      : '#000000',
     shadowEnabled    : true,
+    highlightEnabled : true,
+    bounceEnabled    : true,
     highlightColor   : '#FF6B3D',
     positionX        : 50,
     positionY        : 85,
     alignment        : 'center',
     subtitleStyle    : 'corporate',
+    subtitleMode     : 'line',
     bgBoxEnabled     : false,
     bgBoxColor       : '#000000',
     bgBoxOpacity     : 75,
@@ -1490,16 +1495,23 @@ const SubtitleEngine = (() => {
     preview.style.fontSize         = Math.max(12, Math.round(_style.fontSize * 0.35)) + 'px';
     preview.style.color            = _style.color;
     preview.style.webkitTextStroke = _style.strokeWidth + 'px ' + _style.strokeColor;
-    
+    preview.style.textShadow       = _style.shadowEnabled ? '2px 2px 4px rgba(0,0,0,.85)' : 'none';
+
     preview.style.left = (_style.positionX !== undefined ? _style.positionX : 50) + '%';
     preview.style.top  = (_style.positionY !== undefined ? _style.positionY : 85) + '%';
-    
+
     preview.className = 'subtitle-preview-text';
     if (_style.alignment) {
       preview.classList.add('align-' + _style.alignment);
     }
-    
-    preview.innerHTML = `Merhaba <span class="hl">dünya</span> bu bir test`;
+
+    // Vurgu ve bounce önizlemeye yansır
+    const hlColor = _style.highlightEnabled ? _style.highlightColor : _style.color;
+    const hlClass = _style.bounceEnabled ? 'hl' : 'hl no-bounce';
+    let demo = _style.allCaps ? 'MERHABA DÜNYA BU BIR TEST' : 'Merhaba dünya bu bir test';
+    const word = _style.allCaps ? 'DÜNYA' : 'dünya';
+    demo = demo.replace(word, `<span class="${hlClass}" style="color:${hlColor}">${word}</span>`);
+    preview.innerHTML = demo;
   }
 
   /**
@@ -1569,63 +1581,19 @@ const SubtitleEngine = (() => {
   }
 
   /**
-   * Timeline'a Essential Graphics klipleri olarak enjekte et.
-   * Kurumsal mod: grup başına sabit altyazı.
-   * Dinamik mod: kelime başına klip + pop-in keyframe.
+   * Altyazıları Premiere timeline'ına native caption track olarak ekler.
+   * SRT üretir → projeye aktarır → caption track'e yerleştirir (best-effort).
    */
   async function injectToTimeline() {
     const segmented = TranscriptStore.getSegmentedWords();
     if (segmented.length === 0) throw new Error('Transkript boş. Önce transkript oluşturun.');
 
-    const mode = _style.subtitleStyle || 'corporate';
-    let segments;
-
-    if (mode === 'dynamic') {
-      // Her kelime ayrı bir klip
-      segments = [];
-      segmented.forEach(group => {
-        group.forEach(w => {
-          segments.push({
-            text : _style.allCaps ? w.word.toUpperCase() : w.word,
-            start: w.start,
-            end  : w.end,
-            words: [{ word: w.word, start: w.start, end: w.end }]
-          });
-        });
-      });
-    } else {
-      // Kurumsal: her grubu maks. 8 kelimelik satırlara böl
-      const alignTag = _getAlignmentTag(_style.alignment, _style.positionX, _style.positionY);
-      segments = [];
-      segmented.forEach(group => {
-        for (let i = 0; i < group.length; i += 8) {
-          const slice = group.slice(i, i + 8);
-          const text  = slice.map(w => _style.allCaps ? w.word.toUpperCase() : w.word).join(' ');
-          segments.push({
-            text : alignTag + text,
-            start: slice[0].start,
-            end  : slice[slice.length - 1].end,
-            words: slice.map(w => ({ word: w.word, start: w.start, end: w.end }))
-          });
-        }
-      });
-    }
-
-    const styleParams = {
-      fontName           : _style.fontFamily,
-      fontSize           : _style.fontSize,
-      textColor          : _style.color,
-      alignment          : _style.alignment,
-      trackIndex         : 1,
-      backgroundEnabled  : _style.bgBoxEnabled,
-      backgroundColor    : _style.bgBoxColor,
-      backgroundOpacity  : _style.bgBoxOpacity,
-      mode               : mode
-    };
+    // Native caption track → satır bazlı düz metin (maks ~8 kelime / 42 karakter)
+    const segments = _buildCaptionSegments(segmented);
 
     return new Promise((resolve, reject) => {
       const cs = window.getCSInterface ? window.getCSInterface() : null;
-      const script = `createSubtitleGraphicClips(${JSON.stringify(JSON.stringify(segments))}, ${JSON.stringify(JSON.stringify(styleParams))})`;
+      const script = `createCaptionTrackFromSegments(${JSON.stringify(JSON.stringify(segments))})`;
       if (cs) {
         cs.evalScript(script, result => {
           try { resolve(JSON.parse(result)); }
@@ -1635,6 +1603,46 @@ const SubtitleEngine = (() => {
         reject(new Error('Premiere Pro bağlantısı yok.'));
       }
     });
+  }
+
+  /**
+   * Segment gruplarını caption satırlarına böler. Görünüm moduna göre:
+   *  - word: her kelime ayrı caption
+   *  - full: her segment grubu tek caption
+   *  - line (varsayılan): maks ~8 kelime / 42 karakter
+   */
+  function _buildCaptionSegments(segmented) {
+    const mode = _style.subtitleMode || 'line';
+    const cap  = w => _style.allCaps ? w.word.toUpperCase() : w.word;
+    const segments = [];
+
+    segmented.forEach(group => {
+      if (!group.length) return;
+
+      if (mode === 'word') {
+        group.forEach(w => segments.push({ text: cap(w), start: w.start, end: w.end }));
+        return;
+      }
+      if (mode === 'full') {
+        segments.push({ text: group.map(cap).join(' '), start: group[0].start, end: group[group.length - 1].end });
+        return;
+      }
+
+      // line modu — maks 8 kelime / 42 karakter
+      let i = 0;
+      while (i < group.length) {
+        const slice = [];
+        let chars = 0;
+        while (i < group.length && slice.length < 8 && (chars + group[i].word.length + 1) <= 42) {
+          chars += group[i].word.length + 1;
+          slice.push(group[i]);
+          i++;
+        }
+        if (slice.length === 0) { slice.push(group[i]); i++; } // tek başına uzun kelime
+        segments.push({ text: slice.map(cap).join(' '), start: slice[0].start, end: slice[slice.length - 1].end });
+      }
+    });
+    return segments;
   }
 
   /**
@@ -2222,14 +2230,14 @@ const UIController = (() => {
     _showLoading(true);
     try {
       const result = await SubtitleEngine.injectToTimeline();
-      if (result.success && result.createdCount > 0) {
-        toast(`${result.createdCount} altyazı klibi oluşturuldu ✓`, 'success');
-        log('Timeline enjeksiyonu tamamlandı: ' + result.createdCount + ' klip.', 'success');
-      } else if (result.success && result.createdCount === 0) {
-        toast('Hiç klip oluşturulamadı. Bu Premiere sürümü createGraphicClip\'i desteklemiyor olabilir — "SRT İndir" veya Caption Track yöntemini kullanın.', 'warn');
-        log('Enjeksiyon 0 klip döndü (createGraphicClip desteklenmiyor olabilir).', 'warn');
+      if (result.success && result.placedOnTimeline) {
+        toast(`${result.segmentCount} altyazı caption track'e eklendi ✓`, 'success');
+        log(`Caption track oluşturuldu: ${result.segmentCount} altyazı.`, 'success');
+      } else if (result.success && !result.placedOnTimeline) {
+        toast(result.note || 'SRT projeye aktarıldı — caption track\'e manuel sürükleyin.', 'warn');
+        log('Caption: ' + (result.note || 'projeye aktarıldı, manuel yerleştirme gerekiyor.'), 'warn');
       } else {
-        toast('Enjeksiyon hatası: ' + result.error, 'error');
+        toast('Caption hatası: ' + result.error, 'error');
         log('Hata: ' + result.error, 'error');
       }
     } catch (e) {
@@ -2323,6 +2331,24 @@ const UIController = (() => {
       allCapsToggle.addEventListener('change', () => {
         SubtitleEngine.setStyle({ allCaps: allCapsToggle.checked });
       });
+    }
+
+    // Önizleme toggle'ları: gölge / bounce / vurgu
+    const _wireToggle = (id, styleKey) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (saved[styleKey] !== undefined) el.checked = saved[styleKey];
+      el.addEventListener('change', () => SubtitleEngine.setStyle({ [styleKey]: el.checked }));
+    };
+    _wireToggle('shadowToggle',    'shadowEnabled');
+    _wireToggle('bounceToggle',    'bounceEnabled');
+    _wireToggle('highlightToggle', 'highlightEnabled');
+
+    // Görünüm modu (kelime / satır / tüm metin) — caption üretimini etkiler
+    const modeSel = document.getElementById('subtitleModeSelect');
+    if (modeSel) {
+      if (saved.subtitleMode) modeSel.value = saved.subtitleMode;
+      modeSel.addEventListener('change', () => SubtitleEngine.setStyle({ subtitleMode: modeSel.value }));
     }
 
     // Restore bgOpacity label
