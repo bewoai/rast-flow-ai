@@ -412,14 +412,15 @@ const APIManager = (() => {
 
   async function _sendToWhisper(filePath, apiKey, language, onProgress) {
     return new Promise((resolve, reject) => {
-      if (typeof require !== 'function') {
-        reject(new Error(
-          'Node.js entegrasyonu bulunamadı. ' +
-          'manifest.xml içindeki --enable-nodejs parametresinin aktif olduğundan emin olun.'
-        ));
-        return;
-      }
-      try {
+      (async () => {
+        if (typeof require !== 'function') {
+          reject(new Error(
+            'Node.js entegrasyonu bulunamadı. ' +
+            'manifest.xml içindeki --enable-nodejs parametresinin aktif olduğundan emin olun.'
+          ));
+          return;
+        }
+        try {
         const fs   = require('fs');
         const path = require('path');
         const https = require('https');
@@ -514,6 +515,7 @@ const APIManager = (() => {
       } catch (e) {
         reject(new Error('Whisper isteği başarısız: ' + e.message));
       }
+      })();
     });
   }
 
