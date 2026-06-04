@@ -30,7 +30,9 @@
 
     <div class="transcript-toolbar">
       <button class="btn btn-primary" id="transcribeBtn">✦ Transkript Oluştur</button>
-      <button class="btn btn-secondary btn-sm" id="autoSegmentBtn" title="Otomatik böl">🪄</button>
+      <button class="btn btn-secondary btn-sm" id="punctuateBtn" title="AI ile Türkçe noktalama ekle">¶</button>
+      <button class="btn btn-secondary btn-sm" id="autoSegmentBtn" title="Cümle cümle otomatik böl">🪄</button>
+      <button class="btn btn-secondary btn-sm" id="findReplaceToggle" title="Bul & Değiştir">🔁</button>
       <button class="btn btn-secondary btn-sm" title="Tümünü seç"
         onclick="document.querySelectorAll('.word').forEach(w=>w.classList.add('selected'))">☑</button>
       <button class="btn btn-secondary btn-sm" title="Seçimi temizle"
@@ -43,6 +45,15 @@
         <input type="number" id="silenceThreshold" value="0.4" min="0.1" max="5" step="0.1">
         <span>s</span>
       </div>
+    </div>
+
+    <!-- Bul & Değiştir çubuğu -->
+    <div class="find-replace-bar" id="findReplaceBar" style="display:none;">
+      <input type="text" id="findInput" placeholder="Bul — örn: pikos">
+      <span class="fr-arrow">→</span>
+      <input type="text" id="replaceInput" placeholder="Değiştir — örn: PCOS">
+      <label class="fr-case" title="Büyük/küçük harf duyarlı"><input type="checkbox" id="findCaseSensitive">Aa</label>
+      <button class="btn btn-primary btn-sm" id="replaceAllBtn">Tümünü Değiştir</button>
     </div>
 
     <div class="progress-bar" style="margin:0 16px 10px;"><div class="progress-fill"></div></div>

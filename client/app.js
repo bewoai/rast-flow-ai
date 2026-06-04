@@ -142,35 +142,39 @@ const APIManager = (() => {
     onProgress && onProgress(5,
       useInOutOnly ? 'In/Out aralığı analiz ediliyor…' : 'Sekans analiz ediliyor…');
 
-    const srcRaw = await _evalScript('getPrimarySourceForRange(' + (useInOutOnly ? 'true' : 'false') + ')');
-    let src;
+    const segRaw = await _evalScript('getTimelineAudioSegments(' + (useInOutOnly ? 'true' : 'false') + ')');
+    let info;
     try {
-      src = JSON.parse(srcRaw);
+      info = JSON.parse(segRaw);
     } catch (e) {
       throw new Error('Premiere Pro\'dan geçerli yanıt alınamadı. (CEP bağlantısını kontrol edin.)');
     }
-    if (!src || !src.success) {
-      throw new Error('Kaynak ses alınamadı: ' + (src ? src.error : 'bilinmeyen hata'));
+    if (!info || !info.success) {
+      throw new Error('Kaynak ses alınamadı: ' + (info ? info.error : 'bilinmeyen hata'));
     }
 
-    const baseOffset = (typeof src.timelineStart === 'number') ? src.timelineStart : 0;
+    const baseOffset    = (typeof info.rangeStart === 'number') ? info.rangeStart : 0;
+    const totalDuration = info.rangeEnd - info.rangeStart;
 
-    onProgress && onProgress(15, 'Ses çıkarılıyor…');
-    const filePath = await _extractAudio(src.path, src.srcStart, src.duration);
+    onProgress && onProgress(15,
+      `Ses çıkarılıyor (${info.segments.length} klip · ${info.trackName})…`);
+    const filePath = await _buildTimelineWav(info.segments, info.rangeStart, info.rangeEnd, (p) => {
+      onProgress && onProgress(15 + Math.round(p * 0.15), `Timeline sesi birleştiriliyor… (${info.segments.length} klip)`);
+    });
 
     // Keep active WAV file path for silence detection
     _lastWavPath = filePath;
     _lastWavOffset = baseOffset;
 
-    const rangeMsg = src.mode === 'inout'
-      ? `In/Out aralığı (${baseOffset.toFixed(2)}s – ${src.duration.toFixed(2)}s) Whisper'a gönderiliyor…`
+    const rangeMsg = info.mode === 'inout'
+      ? `In/Out aralığı (${baseOffset.toFixed(1)}s, ${totalDuration.toFixed(1)}s · ${info.segments.length} klip) Whisper'a gönderiliyor…`
       : 'Tüm sekans Whisper\'a gönderiliyor…';
     onProgress && onProgress(30, rangeMsg);
 
     let words;
-    if (src.duration > 900) {
-      onProgress && onProgress(30, `Uzun ses (${(src.duration / 60).toFixed(1)} dk) — 10 dakikalık parçalara bölünüyor…`);
-      words = await _transcribeInChunks(filePath, key, language, src.duration, (p, msg) => {
+    if (totalDuration > 900) {
+      onProgress && onProgress(30, `Uzun ses (${(totalDuration / 60).toFixed(1)} dk) — 10 dakikalık parçalara bölünüyor…`);
+      words = await _transcribeInChunks(filePath, key, language, totalDuration, (p, msg) => {
         onProgress && onProgress(30 + Math.round(p * 60), msg);
       });
     } else {
@@ -229,6 +233,164 @@ const APIManager = (() => {
     }
 
     return allWords;
+  }
+
+  /**
+   * Timeline aralığındaki klipleri tek bir WAV'a birleştirir.
+   * Klipler arası boşluklar sessizlikle korunur → kelime zaman damgaları
+   * timeline ile birebir hizalı kalır. FFmpeg gerektirir (tek klipte WebAudio fallback).
+   */
+  async function _buildTimelineWav(segments, rangeStart, rangeEnd, onProgress) {
+    if (typeof require !== 'function') throw new Error('Node.js entegrasyonu yok.');
+    try {
+      return await _concatWithFfmpeg(segments, rangeStart, rangeEnd, onProgress);
+    } catch (ffErr) {
+      // FFmpeg yok/başarısız → WebAudio ile çoklu klip birleştirme (bağımsız, dosyasız)
+      return await _buildTimelineWavWebAudio(segments, rangeStart, rangeEnd, onProgress);
+    }
+  }
+
+  /** WebAudio ile çoklu klip birleştirici — FFmpeg olmadan çalışır. */
+  async function _buildTimelineWavWebAudio(segments, rangeStart, rangeEnd, onProgress) {
+    const fs   = require('fs');
+    const path = require('path');
+    const os   = require('os');
+    const AC   = window.AudioContext || window.webkitAudioContext;
+    if (!AC) throw new Error('Ses çözücü kullanılamıyor (AudioContext yok) ve FFmpeg bulunamadı.');
+
+    const targetSR     = 16000;
+    const totalSamples = Math.max(1, Math.ceil((rangeEnd - rangeStart) * targetSR));
+    const out          = new Float32Array(totalSamples); // varsayılan sessizlik
+
+    const cache = {};
+    async function getDecoded(p) {
+      if (cache[p]) return cache[p];
+      const buf      = fs.readFileSync(p);
+      const arrayBuf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+      const ctx      = new AC();
+      try {
+        const d = await ctx.decodeAudioData(arrayBuf);
+        cache[p] = d;
+        return d;
+      } finally {
+        try { ctx.close(); } catch (e) {}
+      }
+    }
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      let decoded;
+      try {
+        decoded = await getDecoded(seg.path);
+      } catch (e) {
+        throw new Error('Medya çözülemedi (' + seg.path + '): ' + e.message);
+      }
+      const segData  = await _resampleSegment(decoded, seg.srcStart, seg.duration, targetSR);
+      const outStart = Math.floor((seg.tlStart - rangeStart) * targetSR);
+      for (let j = 0; j < segData.length; j++) {
+        const oi = outStart + j;
+        if (oi >= 0 && oi < totalSamples) out[oi] = segData[j];
+      }
+      onProgress && onProgress(Math.round(((i + 1) / segments.length) * 100));
+    }
+
+    const outPath = path.join(os.tmpdir(), 'rastflow_audio_' + Date.now() + '.wav');
+    fs.writeFileSync(outPath, Buffer.from(_encodeWav(out, targetSR)));
+    return outPath;
+  }
+
+  /** Decoded AudioBuffer'dan [srcStart, srcStart+duration] aralığını 16k mono'ya indirir. */
+  async function _resampleSegment(decoded, srcStart, duration, targetSR) {
+    const inSR        = decoded.sampleRate;
+    const startSample = Math.max(0, Math.floor(srcStart * inSR));
+    const lenSample   = Math.min(decoded.length - startSample, Math.floor(duration * inSR));
+    if (lenSample <= 0) return new Float32Array(0);
+
+    const chs  = decoded.numberOfChannels;
+    const mono = new Float32Array(lenSample);
+    for (let ch = 0; ch < chs; ch++) {
+      const data = decoded.getChannelData(ch);
+      for (let i = 0; i < lenSample; i++) mono[i] += (data[startSample + i] || 0) / chs;
+    }
+
+    const outLen  = Math.max(1, Math.ceil(duration * targetSR));
+    const offline = new OfflineAudioContext(1, outLen, targetSR);
+    const tmpBuf  = offline.createBuffer(1, lenSample, inSR);
+    tmpBuf.copyToChannel(mono, 0);
+    const node = offline.createBufferSource();
+    node.buffer = tmpBuf;
+    node.connect(offline.destination);
+    node.start();
+    const rendered = await offline.startRendering();
+    return rendered.getChannelData(0);
+  }
+
+  function _concatWithFfmpeg(segments, rangeStart, rangeEnd, onProgress) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const fs   = require('fs');
+        const path = require('path');
+        const os   = require('os');
+        const cp   = require('child_process');
+        const SR   = 16000;
+        const ff   = _findFfmpeg();
+        const tmp  = os.tmpdir();
+        const stamp = Date.now();
+        const pieces  = [];
+        const cleanup = [];
+
+        const run = (args, label) => new Promise((res, rej) => {
+          cp.execFile(ff, args, { maxBuffer: 1 << 28 }, (err) => err ? rej(new Error(label + ': ' + err.message)) : res());
+        });
+
+        const genSilence = (dur, idx) => {
+          const p = path.join(tmp, `rastflow_sil_${stamp}_${idx}.wav`);
+          return run(['-f', 'lavfi', '-i', `anullsrc=channel_layout=mono:sample_rate=${SR}`,
+            '-t', dur.toFixed(3), '-c:a', 'pcm_s16le', '-y', p], 'silence').then(() => p);
+        };
+        const extractSeg = (seg, idx) => {
+          const p = path.join(tmp, `rastflow_seg_${stamp}_${idx}.wav`);
+          // Input-seeking (-ss, -i'den ÖNCE) → uzun videolarda 10x hız
+          return run(['-ss', String(seg.srcStart), '-i', seg.path,
+            '-t', String(seg.duration), '-vn', '-ac', '1', '-ar', String(SR),
+            '-c:a', 'pcm_s16le', '-y', p], 'segment').then(() => p);
+        };
+
+        let prevEnd = rangeStart;
+        let silIdx  = 0;
+        for (let i = 0; i < segments.length; i++) {
+          const seg = segments[i];
+          const gap = seg.tlStart - prevEnd;
+          if (gap > 0.02) pieces.push(await genSilence(gap, silIdx++));
+          pieces.push(await extractSeg(seg, i));
+          prevEnd = seg.tlStart + seg.duration;
+          onProgress && onProgress(Math.round(((i + 1) / segments.length) * 100));
+        }
+        const tailGap = rangeEnd - prevEnd;
+        if (tailGap > 0.02) pieces.push(await genSilence(tailGap, silIdx++));
+
+        cleanup.push(...pieces);
+
+        // concat demuxer listesi (tüm parçalar aynı format → -c copy)
+        const listPath = path.join(tmp, `rastflow_concat_${stamp}.txt`);
+        const listBody = pieces.map(p => "file '" + p.replace(/\\/g, '/').replace(/'/g, "'\\''") + "'").join('\n');
+        fs.writeFileSync(listPath, listBody, 'utf8');
+        cleanup.push(listPath);
+
+        const outWav = path.join(tmp, `rastflow_audio_${stamp}.wav`);
+        await run(['-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', '-y', outWav], 'concat');
+
+        cleanup.forEach(p => { try { fs.unlinkSync(p); } catch (e) {} });
+
+        if (!fs.existsSync(outWav) || fs.statSync(outWav).size === 0) {
+          reject(new Error('Birleştirilmiş ses üretilemedi (boş dosya).'));
+          return;
+        }
+        resolve(outWav);
+      } catch (e) {
+        reject(e);
+      }
+    });
   }
 
   async function _sendToWhisper(filePath, apiKey, language, onProgress) {
@@ -533,23 +695,20 @@ const TranscriptStore = (() => {
     _notify();
   }
 
-  function pushUndo(ids) {
-    const snapshot = (ids || _words.map(w => w.id)).map(id => {
-      const w = _words.find(x => x.id === id);
-      return w ? { ...w } : null;
-    }).filter(Boolean);
-    if (!snapshot.length) return;
-    if (_undoStack.length >= 10) _undoStack.shift();
-    _undoStack.push(snapshot);
+  // Tam anlık görüntü — silme/ekleme/taşıma dahil her tür düzenlemeyi geri alır.
+  function pushUndo() {
+    if (_undoStack.length >= 25) _undoStack.shift();
+    _undoStack.push({
+      words   : _words.map(w => ({ ...w })),
+      segments: _segments.map(s => ({ ...s }))
+    });
   }
 
   function undo() {
-    const snapshot = _undoStack.pop();
-    if (!snapshot) return false;
-    snapshot.forEach(saved => {
-      const w = _words.find(x => x.id === saved.id);
-      if (w) Object.assign(w, saved);
-    });
+    const snap = _undoStack.pop();
+    if (!snap) return false;
+    _words    = snap.words.map(w => ({ ...w }));
+    _segments = snap.segments.map(s => ({ ...s }));
     _notify();
     return true;
   }
@@ -563,6 +722,47 @@ const TranscriptStore = (() => {
   function updateWord(id, newText) {
     const w = _words.find(x => x.id === id);
     if (w) { w.word = newText; _notify(); }
+  }
+
+  const _PUNCT = `.,!?;:"'()[]{}…«»–—-`;
+  /** Kelimeyi öncü noktalama / çekirdek / sondaki noktalama olarak ayır. */
+  function splitWord(word) {
+    let s = 0, e = word.length;
+    while (s < e && _PUNCT.indexOf(word[s])     >= 0) s++;
+    while (e > s && _PUNCT.indexOf(word[e - 1]) >= 0) e--;
+    return { lead: word.slice(0, s), core: word.slice(s, e), trail: word.slice(e) };
+  }
+
+  /** Eşleşen TÜM kelimeleri tek hamlede değiştir (noktalamayı korur). Eşleşme sayısını döndürür. */
+  function replaceAll(findText, replaceText, caseSensitive) {
+    const find = (findText || '').trim();
+    if (!find) return 0;
+    const norm   = s => caseSensitive ? s : s.toLocaleLowerCase('tr');
+    const target = norm(find);
+    let count = 0, snapped = false;
+    _words.forEach(w => {
+      const { lead, core, trail } = splitWord(w.word);
+      if (core && norm(core) === target) {
+        if (!snapped) { pushUndo(); snapped = true; }
+        w.word = lead + replaceText + trail;
+        count++;
+      }
+    });
+    if (count) _notify();
+    return count;
+  }
+
+  /** AI/toplu metin güncellemesi: [{id, word}] listesini uygula (tek undo, tek render). */
+  function applyWordTexts(items) {
+    if (!items || !items.length) return 0;
+    pushUndo();
+    let count = 0;
+    items.forEach(it => {
+      const w = _words.find(x => String(x.id) === String(it.id));
+      if (w && typeof it.word === 'string' && it.word.trim()) { w.word = it.word.trim(); count++; }
+    });
+    if (count) _notify();
+    return count;
   }
 
   function deleteWord(id) {
@@ -588,6 +788,7 @@ const TranscriptStore = (() => {
   function insertWordAfter(afterId, newText) {
     const idx = _words.findIndex(x => x.id === afterId);
     if (idx === -1) return;
+    pushUndo();
     const prev = _words[idx];
     const next = _words[idx + 1];
     const midStart = prev.end;
@@ -605,6 +806,67 @@ const TranscriptStore = (() => {
     return newWord;
   }
 
+  /** Yeni kelimeyi belirli bir kelimenin ÖNÜNE ekle (kart başına ekleme için). */
+  function insertWordBefore(beforeId, newText) {
+    const idx = _words.findIndex(x => x.id === beforeId);
+    if (idx === -1) return;
+    if (idx === 0) {
+      pushUndo();
+      const first = _words[0];
+      const newWord = {
+        id: _uid(), word: newText,
+        start: parseFloat(Math.max(0, first.start - 0.3).toFixed(3)),
+        end  : parseFloat(Math.max(0.05, first.start).toFixed(3)),
+        deleted: false, filler: false, repeat: false, virtual: true
+      };
+      _words.unshift(newWord);
+      _notify();
+      return newWord;
+    }
+    return insertWordAfter(_words[idx - 1].id, newText);
+  }
+
+  /** Kelimeyi transkript metninden tamamen çıkar (Whisper hatasını düzeltmek için). */
+  function removeWord(id) {
+    const idx = _words.findIndex(x => x.id === id);
+    if (idx === -1) return;
+    pushUndo();
+    _words.splice(idx, 1);
+    _segments = _segments.filter(s => s.afterWordId !== id); // bu kelimedeki segment break'i de temizle
+    _notify();
+  }
+
+  /** Kelimeyi refId'nin önüne (after=false) veya arkasına (after=true) taşı; zamanı yeniden ata. */
+  function moveWord(id, refId, after) {
+    const fromIdx = _words.findIndex(x => x.id === id);
+    if (fromIdx === -1 || id === refId) return;
+    pushUndo();
+    const moved = _words.splice(fromIdx, 1)[0];
+    let refIdx = _words.findIndex(x => x.id === refId);
+    let toIdx;
+    if (refIdx === -1) toIdx = _words.length;
+    else toIdx = after ? refIdx + 1 : refIdx;
+    _words.splice(toIdx, 0, moved);
+    _reassignTiming(toIdx);
+    _notify();
+  }
+
+  /** Taşınan kelimenin zaman damgasını komşularına göre yeniden hesapla (monoton sıra korunur). */
+  function _reassignTiming(idx) {
+    const w    = _words[idx];
+    const prev = _words[idx - 1];
+    const next = _words[idx + 1];
+    let start, end;
+    if (prev && next)  { start = prev.end;                    end = Math.max(prev.end + 0.05, next.start); }
+    else if (prev)     { start = prev.end;                    end = prev.end + 0.3; }
+    else if (next)     { start = Math.max(0, next.start - 0.3); end = next.start; }
+    else               { start = 0;                           end = 0.3; }
+    if (end <= start) end = start + 0.2;
+    w.start = parseFloat(start.toFixed(3));
+    w.end   = parseFloat(end.toFixed(3));
+    w.moved = true;
+  }
+
   function addSegmentBreak(afterWordId) {
     if (!_segments.find(s => s.afterWordId === afterWordId)) {
       _segments.push({ afterWordId, id: _uid() });
@@ -614,6 +876,12 @@ const TranscriptStore = (() => {
 
   function removeSegmentBreak(afterWordId) {
     _segments = _segments.filter(s => s.afterWordId !== afterWordId);
+    _notify();
+  }
+
+  /** Tüm segment break'lerini tek seferde ayarla (otomatik bölme için — tek render). */
+  function setSegmentBreaks(afterWordIds) {
+    _segments = (afterWordIds || []).map(id => ({ afterWordId: id, id: _uid() }));
     _notify();
   }
 
@@ -697,8 +965,9 @@ const TranscriptStore = (() => {
 
   return {
     load, getWords, getSegments, updateWord, deleteWord, restoreWord,
-    markFiller, markRepeat, insertWordAfter,
-    addSegmentBreak, removeSegmentBreak,
+    markFiller, markRepeat, insertWordAfter, insertWordBefore, removeWord, moveWord,
+    replaceAll, applyWordTexts, splitWord,
+    addSegmentBreak, removeSegmentBreak, setSegmentBreaks,
     getSegmentedWords, getDeleteRanges,
     markAppliedCuts,
     pushUndo, undo, onChange, notifyAll
@@ -713,6 +982,7 @@ const TranscriptEditor = (() => {
   let _container    = null;
   let _contextMenu  = null;
   let _currentTime  = 0;
+  let _dragId       = null;
 
   function init(containerId) {
     _container = document.getElementById(containerId);
@@ -793,12 +1063,16 @@ const TranscriptEditor = (() => {
           });
         }
 
+        const wrap = document.createElement('span');
+        wrap.className = 'word-wrap';
+
         const span = document.createElement('span');
         span.className     = 'word';
         span.dataset.id    = w.id;
         span.dataset.start = w.start;
         span.dataset.end   = w.end;
         span.textContent   = w.word;
+        span.draggable     = true;
 
         if (w.filler)  span.classList.add('filler');
         if (w.repeat)  span.classList.add('repeat');
@@ -806,13 +1080,41 @@ const TranscriptEditor = (() => {
           span.classList.add('ai-deleted');
           if (w.aiReason) span.dataset.aiReason = w.aiReason;
         }
-        if (w.virtual) span.title = 'Interpolasyon ile eklendi';
+        if (w.virtual || w.moved) span.title = 'Elle düzenlendi';
 
         span.addEventListener('click',       _onWordClick);
         span.addEventListener('dblclick',    _onWordDblClick);
         span.addEventListener('contextmenu', _onWordContextMenu);
-        body.appendChild(span);
+        span.addEventListener('dragstart',   _onDragStart);
+        span.addEventListener('dragover',    _onDragOver);
+        span.addEventListener('dragleave',   _onDragLeave);
+        span.addEventListener('drop',        _onDrop);
+        span.addEventListener('dragend',     _onDragEnd);
+
+        // × Transkriptten sil
+        const xBtn = document.createElement('span');
+        xBtn.className   = 'word-x';
+        xBtn.textContent = '×';
+        xBtn.title       = 'Transkriptten sil';
+        xBtn.addEventListener('click', (ev) => { ev.stopPropagation(); TranscriptStore.removeWord(w.id); });
+
+        wrap.appendChild(span);
+        wrap.appendChild(xBtn);
+        body.appendChild(wrap);
+        body.appendChild(document.createTextNode(' ')); // satır kaydırma için boşluk
       });
+
+      // ＋ Bu satıra kelime ekle
+      const addBtn = document.createElement('span');
+      addBtn.className   = 'word-add';
+      addBtn.textContent = '＋';
+      addBtn.title       = 'Bu satıra kelime ekle';
+      const lastW = group[group.length - 1];
+      addBtn.addEventListener('click', () => {
+        const t = prompt('Eklenecek kelime:');
+        if (t && t.trim()) TranscriptStore.insertWordAfter(lastW.id, t.trim());
+      });
+      body.appendChild(addBtn);
 
       card.appendChild(body);
       fragment.appendChild(card);
@@ -846,11 +1148,52 @@ const TranscriptEditor = (() => {
     _updatePlayingWord();
   }
 
+  /* ── Sürükle-bırak ile kelime taşıma ── */
+  function _onDragStart(e) {
+    _dragId = e.currentTarget.dataset.id;
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', _dragId); } catch (x) {}
+    e.currentTarget.classList.add('dragging');
+  }
+  function _onDragOver(e) {
+    if (!_dragId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const span = e.currentTarget;
+    if (span.dataset.id === _dragId) return;
+    const rect  = span.getBoundingClientRect();
+    const after = (e.clientX - rect.left) > rect.width / 2;
+    span.classList.toggle('drop-after', after);
+    span.classList.toggle('drop-before', !after);
+  }
+  function _onDragLeave(e) {
+    e.currentTarget.classList.remove('drop-before', 'drop-after');
+  }
+  function _onDrop(e) {
+    e.preventDefault();
+    const span  = e.currentTarget;
+    const refId = span.dataset.id;
+    const after = span.classList.contains('drop-after');
+    span.classList.remove('drop-before', 'drop-after');
+    if (_dragId && refId && _dragId !== refId) {
+      TranscriptStore.moveWord(_dragId, refId, after);
+    }
+    _dragId = null;
+  }
+  function _onDragEnd() {
+    _dragId = null;
+    if (_container) {
+      _container.querySelectorAll('.dragging, .drop-before, .drop-after')
+        .forEach(el => el.classList.remove('dragging', 'drop-before', 'drop-after'));
+    }
+  }
+
   function _onWordDblClick(e) {
     const span = e.currentTarget;
     const id   = span.dataset.id;
     const old  = span.textContent;
 
+    span.draggable = false; // düzenleme sırasında sürüklemeyi kapat
     span.innerHTML = '';
     const input = document.createElement('input');
     input.className = 'word-edit';
@@ -884,6 +1227,9 @@ const TranscriptEditor = (() => {
       <div class="menu-item" data-action="edit">
         <span class="icon">✎</span> Düzenle
       </div>
+      <div class="menu-item" data-action="replace-all">
+        <span class="icon">🔁</span> Tüm "${word}" → değiştir…
+      </div>
       <div class="menu-item" data-action="insert-before">
         <span class="icon">+</span> Önüne kelime ekle
       </div>
@@ -894,11 +1240,14 @@ const TranscriptEditor = (() => {
         <span class="icon">⏎</span> Burada segment böl
       </div>
       <div class="divider"></div>
-      <div class="menu-item" data-action="mark-filler">
-        <span class="icon">⚠</span> Filler olarak işaretle
+      <div class="menu-item danger" data-action="remove">
+        <span class="icon">🗑</span> Transkriptten sil
       </div>
-      <div class="menu-item danger" data-action="delete">
-        <span class="icon">✕</span> Bu kelimeyi sil
+      <div class="menu-item" data-action="mark-filler">
+        <span class="icon">⚠</span> Filler işaretle
+      </div>
+      <div class="menu-item" data-action="cut">
+        <span class="icon">✂</span> Videodan kes (kesim listesine)
       </div>`;
 
     _contextMenu.querySelectorAll('.menu-item').forEach(item => {
@@ -921,18 +1270,23 @@ const TranscriptEditor = (() => {
       case 'edit':
         span.dispatchEvent(new MouseEvent('dblclick'));
         break;
-      case 'insert-before':
-      case 'insert-after': {
-        const text = prompt('Yeni kelime:');
-        if (text && text.trim()) {
-          const afterId = action === 'insert-after' ? id :
-            (() => {
-              const words = TranscriptStore.getWords();
-              const idx   = words.findIndex(w => w.id === id);
-              return idx > 0 ? words[idx - 1].id : null;
-            })();
-          if (afterId) TranscriptStore.insertWordAfter(afterId, text.trim());
+      case 'replace-all': {
+        const core = TranscriptStore.splitWord(word).core || word;
+        const rep  = prompt(`Tüm "${core}" kelimelerini neyle değiştirelim?`, core);
+        if (rep !== null && rep.trim()) {
+          const n = TranscriptStore.replaceAll(core, rep.trim(), false);
+          UIController.toast(`${n} "${core}" → "${rep.trim()}" olarak değiştirildi.`, n ? 'success' : 'info');
         }
+        break;
+      }
+      case 'insert-before': {
+        const text = prompt('Önüne eklenecek kelime:');
+        if (text && text.trim()) TranscriptStore.insertWordBefore(id, text.trim());
+        break;
+      }
+      case 'insert-after': {
+        const text = prompt('Sonrasına eklenecek kelime:');
+        if (text && text.trim()) TranscriptStore.insertWordAfter(id, text.trim());
         break;
       }
       case 'segment-break':
@@ -941,7 +1295,10 @@ const TranscriptEditor = (() => {
       case 'mark-filler':
         TranscriptStore.markFiller(id);
         break;
-      case 'delete':
+      case 'remove':
+        TranscriptStore.removeWord(id);
+        break;
+      case 'cut':
         TranscriptStore.deleteWord(id);
         break;
     }
@@ -1319,9 +1676,9 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
     let responseText;
 
     if (typeof require === 'function') {
-      responseText = await _callApiNode(apiKey, model, isAnthropic, userContent, onStatus);
+      responseText = await _callApiNode(apiKey, model, isAnthropic, SYSTEM_PROMPT, userContent, onStatus);
     } else {
-      responseText = await _callApiFetch(apiKey, model, isAnthropic, userContent, onStatus);
+      responseText = await _callApiFetch(apiKey, model, isAnthropic, SYSTEM_PROMPT, userContent, onStatus);
     }
 
     let parsed;
@@ -1357,13 +1714,13 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
     return { deletedCount: matched, reasons: _reasons };
   }
 
-  async function _callApiNode(apiKey, model, isAnthropic, userContent, onStatus) {
+  async function _callApiNode(apiKey, model, isAnthropic, systemPrompt, userContent, onStatus) {
     return new Promise((resolve, reject) => {
       const https = require('https');
       const body  = Buffer.from(JSON.stringify(
         isAnthropic
-          ? { model, max_tokens: 4096, system: SYSTEM_PROMPT, messages: [{ role: 'user', content: userContent }] }
-          : { model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent }], response_format: { type: 'json_object' } }
+          ? { model, max_tokens: 4096, system: systemPrompt, messages: [{ role: 'user', content: userContent }] }
+          : { model, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }], response_format: { type: 'json_object' } }
       ));
 
       const opts = {
@@ -1399,11 +1756,11 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
     });
   }
 
-  async function _callApiFetch(apiKey, model, isAnthropic, userContent, onStatus) {
+  async function _callApiFetch(apiKey, model, isAnthropic, systemPrompt, userContent, onStatus) {
     const url  = isAnthropic ? 'https://api.anthropic.com/v1/messages' : 'https://api.openai.com/v1/chat/completions';
     const body = isAnthropic
-      ? { model, max_tokens: 4096, system: SYSTEM_PROMPT, messages: [{ role: 'user', content: userContent }] }
-      : { model, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent }], response_format: { type: 'json_object' } };
+      ? { model, max_tokens: 4096, system: systemPrompt, messages: [{ role: 'user', content: userContent }] }
+      : { model, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }], response_format: { type: 'json_object' } };
 
     const headers = {
       'Content-Type': 'application/json',
@@ -1420,9 +1777,63 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
       : (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content);
   }
 
+  const PUNCT_PROMPT = `Sen bir Türkçe metin editörüsün. Sana sırayla kelimeler [{id, word}] verilecek.
+Görevin: Türkçe dil bilgisine uygun noktalama işaretlerini (. , ? ! : ; …) eklemek ve cümle başlarını ile özel adları büyük harfle düzeltmek.
+
+KESİN KURALLAR:
+- Kelime EKLEME, SİLME, BİRLEŞTİRME veya SIRASINI DEĞİŞTİRME. Sadece her kelimenin yazımını düzelt.
+- Noktalama işaretini ait olduğu kelimeye bitişik yaz (örn. "evet," / "tamam." / "gidelim").
+- Soru cümlelerinde "mı/mi/mu/mü" veya soru sözcüğü varsa cümle sonuna "?" koy.
+- Gönderilen id'leri ve kelime SAYISINI birebir koru.
+
+SADECE şu JSON ile yanıt ver, başka açıklama yazma:
+{"words":[{"id":"<id>","word":"<düzeltilmiş kelime>"}]}`;
+
+  /** AI Editör anahtarı yoksa Whisper (OpenAI) anahtarına düş. */
+  function _resolveKeyModel() {
+    const s = _loadSettings();
+    let apiKey = (s.apiKey || '').trim();
+    let model  = s.model || '';
+    if (!apiKey && typeof APIManager !== 'undefined' && APIManager.getApiKey) {
+      apiKey = APIManager.getApiKey();
+      if (!model) model = 'gpt-4o-mini';
+    }
+    if (!model) model = 'gpt-4o-mini';
+    return { apiKey, model, isAnthropic: model.indexOf('claude') === 0 };
+  }
+
+  async function addPunctuationWithAI(onStatus) {
+    const { apiKey, model, isAnthropic } = _resolveKeyModel();
+    if (!apiKey) throw new Error('API anahtarı yok. Ayarlar (OpenAI) veya AI Editör sekmesinden girin.');
+
+    const words = TranscriptStore.getWords().map(w => ({ id: w.id, word: w.word }));
+    if (!words.length) throw new Error('Transkript boş.');
+
+    onStatus && onStatus('Noktalama için AI\'ya gönderiliyor…');
+    const userContent = 'Kelimeler (JSON):\n' + JSON.stringify(words);
+
+    let responseText;
+    if (typeof require === 'function') {
+      responseText = await _callApiNode(apiKey, model, isAnthropic, PUNCT_PROMPT, userContent, onStatus);
+    } else {
+      responseText = await _callApiFetch(apiKey, model, isAnthropic, PUNCT_PROMPT, userContent, onStatus);
+    }
+
+    let parsed;
+    try {
+      const m = responseText.match(/\{[\s\S]*\}/);
+      parsed = JSON.parse(m ? m[0] : responseText);
+    } catch (e) {
+      throw new Error('AI yanıtı çözümlenemedi: ' + String(responseText).slice(0, 200));
+    }
+    const items = parsed.words || parsed.items || [];
+    const count = TranscriptStore.applyWordTexts(items);
+    return { count };
+  }
+
   function getReasons() { return _reasons; }
 
-  return { initUI, cleanTranscriptWithAI, getReasons };
+  return { initUI, cleanTranscriptWithAI, addPunctuationWithAI, getReasons };
 })();
 
 
@@ -1651,42 +2062,52 @@ const SubtitleEngine = (() => {
    * @param {number} maxDuration     Segment maks. süresi saniye (varsayılan 3.0)
    * @param {number} silenceThreshold Sessizlik eşiği saniye (varsayılan 0.5)
    */
+  /**
+   * Cümle-farkında otomatik bölme: önce cümle sonlarından (. ! ? …) böler,
+   * cümle uzunsa virgül/uzun sessizlik/karakter limitinde alt-böler.
+   * @param {number} maxChars   Satır başına maks karakter (varsayılan 42)
+   * @param {number} maxDuration Segment maks. süresi sn (varsayılan 6.0)
+   * @param {number} silenceThreshold Sessizlik eşiği sn (varsayılan 0.6)
+   */
   function autoSegmentSubtitles(maxChars, maxDuration, silenceThreshold) {
-    maxChars         = maxChars         || 35;
-    maxDuration      = maxDuration      || 3.0;
-    silenceThreshold = silenceThreshold || 0.5;
+    maxChars         = maxChars         || 42;
+    maxDuration      = maxDuration      || 6.0;
+    silenceThreshold = silenceThreshold || 0.6;
 
     const words = TranscriptStore.getWords();
-    if (!words.length) return 0;
+    if (words.length < 2) return 0;
 
-    // Önce mevcut segment break'leri temizle
-    TranscriptStore.getSegments().forEach(s => TranscriptStore.removeSegmentBreak(s.afterWordId));
+    const SENT_END   = /[.!?…]["')\]]?$/;   // cümle sonu
+    const CLAUSE_END = /[,;:]["')\]]?$/;     // bağlaç/virgül
 
-    const PUNCT_RE = /[.!?,\-—;:]/;
-    let breakCount = 0;
+    const breakIds = [];
     let segStart   = 0;
 
+    const flush = (i) => { breakIds.push(words[i].id); segStart = i + 1; };
+
     for (let i = 0; i < words.length - 1; i++) {
-      const w       = words[i];
-      const next    = words[i + 1];
-      const segText = words.slice(segStart, i + 1).map(x => x.word).join(' ');
-      const chars   = segText.length;
-      const dur     = w.end - words[segStart].start;
-      const gap     = next.start - w.end;
+      const w     = words[i];
+      const next  = words[i + 1];
+      const chars = words.slice(segStart, i + 1).map(x => x.word).join(' ').length;
+      const dur   = w.end - words[segStart].start;
+      const gap   = next.start - w.end;
 
-      const hasPunct    = PUNCT_RE.test(w.word);
-      const overChars   = chars >= maxChars;
-      const overDur     = dur  >= maxDuration;
-      const bigSilence  = gap  >= silenceThreshold;
-
-      if (overChars || overDur || (hasPunct && (chars > 12 || bigSilence)) || bigSilence) {
-        TranscriptStore.addSegmentBreak(w.id);
-        segStart = i + 1;
-        breakCount++;
+      if (SENT_END.test(w.word) && chars >= 4) {            // cümle sonu → her zaman böl
+        flush(i); continue;
+      }
+      if (chars >= maxChars || dur >= maxDuration) {         // limit aşıldı → böl
+        flush(i); continue;
+      }
+      if (gap >= silenceThreshold && chars >= 8) {           // uzun sessizlik → böl
+        flush(i); continue;
+      }
+      if (CLAUSE_END.test(w.word) && chars >= 28) {          // uzun cümlede virgülde böl
+        flush(i); continue;
       }
     }
 
-    return breakCount;
+    TranscriptStore.setSegmentBreaks(breakIds);
+    return breakIds.length;
   }
 
   return { getStyle, setStyle, generateSubtitles, injectToTimeline, autoSegmentSubtitles };
@@ -1825,9 +2246,29 @@ const UIController = (() => {
     const autoSegBtn = document.getElementById('autoSegmentBtn');
     if (autoSegBtn) autoSegBtn.addEventListener('click', () => {
       const n = SubtitleEngine.autoSegmentSubtitles();
-      toast(n > 0 ? `${n} segment break oluşturuldu.` : 'Segment break oluşturulamadı (önce transkript oluşturun).', n > 0 ? 'success' : 'warn');
-      log('Otomatik bölme: ' + n + ' segment.', 'info');
+      toast(n > 0 ? `${n + 1} cümle bloğuna bölündü.` : 'Bölme yapılamadı (önce transkript oluşturun).', n > 0 ? 'success' : 'warn');
+      log('Otomatik bölme: ' + n + ' kesim noktası.', 'info');
     });
+
+    // AI Türkçe noktalama
+    const punctuateBtn = document.getElementById('punctuateBtn');
+    if (punctuateBtn) punctuateBtn.addEventListener('click', _onPunctuate);
+
+    // Bul & Değiştir
+    const frToggle = document.getElementById('findReplaceToggle');
+    const frBar    = document.getElementById('findReplaceBar');
+    if (frToggle && frBar) {
+      frToggle.addEventListener('click', () => {
+        const show = frBar.style.display === 'none';
+        frBar.style.display = show ? 'flex' : 'none';
+        frToggle.classList.toggle('active', show);
+        if (show) document.getElementById('findInput')?.focus();
+      });
+    }
+    const replaceAllBtn = document.getElementById('replaceAllBtn');
+    if (replaceAllBtn) replaceAllBtn.addEventListener('click', _onReplaceAll);
+    const replaceInput = document.getElementById('replaceInput');
+    if (replaceInput) replaceInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') _onReplaceAll(); });
 
     // Stil kontrolleri
     _initStyleControls();
@@ -2114,6 +2555,35 @@ const UIController = (() => {
     toast(count > 0
       ? `${count} filler işaretlendi — alt çubuktan "Premiere'e Uygula" ile kes.`
       : 'Filler kelime bulunamadı.', count > 0 ? 'warn' : 'info');
+  }
+
+  async function _onPunctuate() {
+    const btn = document.getElementById('punctuateBtn');
+    if (TranscriptStore.getWords().length === 0) { toast('Önce transkript oluşturun.', 'warn'); return; }
+    if (btn) btn.disabled = true;
+    _showLoading(true);
+    try {
+      const lt = document.getElementById('loadingText');
+      const { count } = await AIEditorEngine.addPunctuationWithAI((msg) => { if (lt) lt.textContent = msg; });
+      toast(`Türkçe noktalama eklendi (${count} kelime güncellendi).`, 'success');
+      log('AI noktalama tamamlandı: ' + count + ' kelime.', 'success');
+    } catch (e) {
+      toast('Noktalama hatası: ' + e.message, 'error');
+      log('Noktalama hatası: ' + e.message, 'error');
+    } finally {
+      if (btn) btn.disabled = false;
+      _showLoading(false);
+    }
+  }
+
+  function _onReplaceAll() {
+    const find = (document.getElementById('findInput')?.value || '').trim();
+    const rep  = document.getElementById('replaceInput')?.value || '';
+    const cs   = document.getElementById('findCaseSensitive')?.checked === true;
+    if (!find) { toast('Aranacak kelimeyi yazın.', 'warn'); return; }
+    const n = TranscriptStore.replaceAll(find, rep, cs);
+    toast(n ? `${n} kelime "${rep}" olarak değiştirildi.` : `"${find}" bulunamadı.`, n ? 'success' : 'info');
+    log(`Bul & Değiştir: "${find}" → "${rep}" (${n} eşleşme).`, 'info');
   }
 
   async function _onApplyDelete() {

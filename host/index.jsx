@@ -202,6 +202,102 @@ function _firstSelectedClip(seq, rStart, rEnd) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+   2b. getTimelineAudioSegments() — In/Out aralığındaki TÜM konuşma klipleri
+   Timeline parçalara bölünmüş olsa bile aralığın tamamını kapsar.
+   ══════════════════════════════════════════════════════════════════ */
+
+function getTimelineAudioSegments(useInOutOnly) {
+  try {
+    if (typeof useInOutOnly === "string") {
+      useInOutOnly = (useInOutOnly === "true" || useInOutOnly === "1");
+    }
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans bulunamadı." });
+
+    var rStart, rEnd, mode;
+    if (useInOutOnly) {
+      var inS  = _toSeconds(seq.getInPoint());
+      var outS = _toSeconds(seq.getOutPoint());
+      if (!((outS > inS) && (outS > 0))) {
+        return JSON.stringify({ success: false, error: "Timeline'da geçerli In/Out aralığı yok. I ve O ile aralık işaretleyin veya 'Sadece In/Out aralığı'nı kapatın." });
+      }
+      rStart = inS; rEnd = outS; mode = "inout";
+    } else {
+      rStart = 0; rEnd = _toSeconds(seq.end); mode = "full";
+    }
+    if (rEnd <= rStart) return JSON.stringify({ success: false, error: "Geçerli bir aralık hesaplanamadı." });
+
+    var trackIdx = _audioTrackForRange(seq, rStart, rEnd);
+    if (trackIdx < 0) {
+      return JSON.stringify({ success: false, error: "Seçili aralıkta ses klibi bulunamadı." });
+    }
+
+    var track = seq.audioTracks[trackIdx];
+    var segs = [];
+    for (var c = 0; c < track.clips.numItems; c++) {
+      var cl = track.clips[c];
+      var s = _toSeconds(cl.start), e = _toSeconds(cl.end);
+      if (s < rEnd && e > rStart && cl.projectItem) {
+        var path = "";
+        try { if (cl.projectItem.getMediaPath) path = cl.projectItem.getMediaPath(); } catch (e2) { path = ""; }
+        if (!path) continue;
+        var clipIn = _toSeconds(cl.inPoint);
+        var rs = Math.max(rStart, s), re = Math.min(rEnd, e);
+        if (re <= rs) continue;
+        segs.push({
+          path    : path,
+          srcStart: clipIn + (rs - s),
+          duration: re - rs,
+          tlStart : rs
+        });
+      }
+    }
+    if (!segs.length) return JSON.stringify({ success: false, error: "Seçili aralıkta okunabilir ses klibi bulunamadı." });
+
+    segs.sort(function (a, b) { return a.tlStart - b.tlStart; });
+
+    return JSON.stringify({
+      success   : true,
+      mode      : mode,
+      rangeStart: rStart,
+      rangeEnd  : rEnd,
+      trackName : (track.name ? track.name : ("A" + (trackIdx + 1))),
+      segments  : segs
+    });
+
+  } catch (e) {
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/** Aralık için hedef ses kanalı: önce seçili ses klibinin kanalı, yoksa aralıkta klibi olan ilk kanal. */
+function _audioTrackForRange(seq, rStart, rEnd) {
+  // 1) Kullanıcının seçtiği ses klibinin kanalı
+  for (var t = 0; t < seq.audioTracks.numTracks; t++) {
+    var tr = seq.audioTracks[t];
+    for (var c = 0; c < tr.clips.numItems; c++) {
+      var cl = tr.clips[c];
+      try {
+        if (cl.isSelected && cl.isSelected() && cl.projectItem) {
+          var s = _toSeconds(cl.start), e = _toSeconds(cl.end);
+          if (s < rEnd && e > rStart) return t;
+        }
+      } catch (e2) {}
+    }
+  }
+  // 2) Aralıkta klibi olan ilk (en alttaki, A1) ses kanalı — konuşma genelde A1
+  for (var t2 = 0; t2 < seq.audioTracks.numTracks; t2++) {
+    var tr2 = seq.audioTracks[t2];
+    for (var c2 = 0; c2 < tr2.clips.numItems; c2++) {
+      var cl2 = tr2.clips[c2];
+      var s2 = _toSeconds(cl2.start), e2 = _toSeconds(cl2.end);
+      if (s2 < rEnd && e2 > rStart && cl2.projectItem) return t2;
+    }
+  }
+  return -1;
+}
+
+/* ══════════════════════════════════════════════════════════════════
    3. getSequenceInfo()
    ══════════════════════════════════════════════════════════════════ */
 

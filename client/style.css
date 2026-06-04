@@ -351,6 +351,24 @@ input[type=range]::-webkit-slider-thumb {
 }
 .silence-control input[type=number] { width: 56px; padding: 6px 8px; text-align: center; font-size: 11px; }
 
+/* Bul & Değiştir çubuğu */
+.find-replace-bar {
+  display: flex; align-items: center; gap: 7px;
+  margin: 0 16px 10px; padding: 8px 10px;
+  background: var(--bg-1); border: 1px solid var(--border-2);
+  border-radius: var(--r); flex-shrink: 0;
+  animation: fadeUp .25s var(--spring);
+}
+.find-replace-bar input[type=text] { flex: 1; min-width: 0; padding: 7px 10px; font-size: 12px; }
+.find-replace-bar .fr-arrow { color: var(--accent-bright); font-weight: 800; flex-shrink: 0; }
+.find-replace-bar .fr-case {
+  display: flex; align-items: center; gap: 3px; flex-shrink: 0;
+  font-size: 11px; font-weight: 700; color: var(--text-2); cursor: pointer; user-select: none;
+}
+.find-replace-bar .fr-case input { width: auto; margin: 0; }
+.find-replace-bar .btn { flex-shrink: 0; }
+.transcript-toolbar .btn.active { background: var(--accent-soft); color: var(--accent-bright); box-shadow: inset 0 0 0 1px var(--accent); }
+
 .transcript-wrap {
   flex: 1; margin: 0 16px 12px;
   background: var(--bg-1); border: 1px solid var(--border);
@@ -366,10 +384,37 @@ input[type=range]::-webkit-slider-thumb {
   display: inline; cursor: pointer;
   border-radius: 7px; padding: 2px 4px;
   color: var(--text-1); font-size: 13px;
-  transition: background .12s, color .12s;
+  transition: background .12s, color .12s, box-shadow .12s;
 }
-.word::after { content: ' '; white-space: pre; }
 .word:hover { background: var(--bg-hover); color: var(--text-0); }
+
+/* Kelime sarmalayıcı + düzenleme kontrolleri */
+.word-wrap { position: relative; display: inline-block; }
+.word-x {
+  position: absolute; top: -8px; right: -4px;
+  width: 15px; height: 15px; border-radius: 50%;
+  background: var(--red); color: #fff;
+  font-size: 12px; line-height: 14px; text-align: center;
+  cursor: pointer; opacity: 0; pointer-events: none;
+  box-shadow: 0 1px 5px rgba(0,0,0,.45); z-index: 4;
+  transition: opacity .12s, transform .12s;
+}
+.word-wrap:hover .word-x { opacity: 1; pointer-events: auto; }
+.word-x:hover { transform: scale(1.2); }
+
+.word[draggable="true"] { cursor: grab; }
+.word.dragging { opacity: .35; cursor: grabbing; }
+.word.drop-before { box-shadow: inset 3px 0 0 var(--accent-bright); }
+.word.drop-after  { box-shadow: inset -3px 0 0 var(--accent-bright); }
+
+.word-add {
+  display: inline-block; cursor: pointer; user-select: none;
+  color: var(--text-2); font-weight: 700; font-size: 13px;
+  padding: 0 7px; margin-left: 4px; border-radius: 7px;
+  border: 1px dashed var(--border-2);
+  transition: color .12s, background .12s, border-color .12s;
+}
+.word-add:hover { color: var(--accent-bright); border-color: var(--accent); background: var(--accent-soft); }
 .word.playing { color: #fff; background: linear-gradient(150deg, var(--accent), var(--accent-deep)); box-shadow: 0 2px 8px var(--accent-glow); }
 .word.marked-delete { color: var(--red); text-decoration: line-through; background: rgba(239,83,80,.12); }
 .word.filler { color: var(--accent-bright); background: var(--accent-soft); }
