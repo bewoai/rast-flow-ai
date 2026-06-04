@@ -125,6 +125,37 @@ const APIManager = (() => {
     return k.slice(0, 4) + '•'.repeat(Math.max(0, k.length - 8)) + k.slice(-4);
   }
 
+  /* ── Transkript Motorları ── */
+  const ENGINES = {
+    openai: { hostname: 'api.openai.com', path: '/v1/audio/transcriptions',        model: 'whisper-1' },
+    groq:   { hostname: 'api.groq.com',   path: '/openai/v1/audio/transcriptions', model: 'whisper-large-v3' }
+  };
+  let _engine  = '';
+  let _groqKey = '';
+
+  function getEngine() {
+    if (_engine) return _engine;
+    _engine = _readConfig().engine || 'openai';
+    return _engine;
+  }
+  function setEngine(eng) {
+    if (['openai', 'groq', 'local'].indexOf(eng) < 0) return;
+    _engine = eng;
+    const cfg = _readConfig(); cfg.engine = eng; _persist(cfg);
+  }
+  function setGroqKey(key) {
+    const clean = _sanitizeKey(key);
+    if (!clean) return;
+    _groqKey = clean;
+    const cfg = _readConfig(); cfg.groqKey = _encrypt(clean); _persist(cfg);
+  }
+  function getGroqKey() {
+    if (_groqKey) return _groqKey;
+    _groqKey = _sanitizeKey(_decrypt(_readConfig().groqKey || ''));
+    return _groqKey;
+  }
+  function hasGroqKey() { return !!getGroqKey(); }
+
   /**
    * ExtendScript'ten ses dosyasını export et, ardından Whisper'a gönder.
    * @param {Function} onProgress (pct, msg)
@@ -133,8 +164,13 @@ const APIManager = (() => {
    */
   async function transcribe(onProgress, options) {
     options = options || {};
-    const key = getApiKey();
-    if (!key) throw new Error('API Key girilmemiş. Lütfen Ayarlar\'dan API Key girin.');
+    const engine = getEngine();                       // 'openai' | 'groq' | 'local'
+    const cfg    = ENGINES[engine] || ENGINES.openai;
+    const key    = (engine === 'groq') ? getGroqKey() : getApiKey();
+
+    if (engine !== 'local' && !key) {
+      throw new Error((engine === 'groq' ? 'Groq' : 'OpenAI') + ' API anahtarı girilmemiş. Ayarlar\'dan girin.');
+    }
 
     const scope    = options.scope || 'full';
     const language = options.language || 'tr';
@@ -168,21 +204,23 @@ const APIManager = (() => {
     _lastWavPath = filePath;
     _lastWavOffset = baseOffset;
 
-    const rangeMsg = info.mode === 'inout'
-      ? `In/Out aralığı (${baseOffset.toFixed(1)}s, ${totalDuration.toFixed(1)}s · ${info.segments.length} klip) Whisper'a gönderiliyor…`
-      : 'Tüm sekans Whisper\'a gönderiliyor…';
-    onProgress && onProgress(30, rangeMsg);
+    const engineLabel = engine === 'groq' ? 'Groq' : engine === 'local' ? 'yerel motor' : 'OpenAI';
+    onProgress && onProgress(30, `${totalDuration.toFixed(1)}s ses ${engineLabel}'a gönderiliyor…`);
 
     let words;
-    if (totalDuration > 900) {
+    if (engine === 'local') {
+      words = await _transcribeLocal(filePath, language, totalDuration, (p, msg) => {
+        onProgress && onProgress(30 + Math.round(p * 60), msg || 'Yerel transkript…');
+      });
+    } else if (totalDuration > 900) {
       onProgress && onProgress(30, `Uzun ses (${(totalDuration / 60).toFixed(1)} dk) — 10 dakikalık parçalara bölünüyor…`);
-      words = await _transcribeInChunks(filePath, key, language, totalDuration, (p, msg) => {
+      words = await _transcribeInChunks(filePath, key, language, totalDuration, cfg, (p, msg) => {
         onProgress && onProgress(30 + Math.round(p * 60), msg);
       });
     } else {
       words = await _sendToWhisper(filePath, key, language, (p) => {
         onProgress && onProgress(30 + Math.round(p * 60), 'Transkript alınıyor…');
-      });
+      }, cfg);
     }
 
     if (baseOffset > 0) {
@@ -196,7 +234,7 @@ const APIManager = (() => {
     return words;
   }
 
-  async function _transcribeInChunks(filePath, apiKey, language, totalDuration, onProgress) {
+  async function _transcribeInChunks(filePath, apiKey, language, totalDuration, cfg, onProgress) {
     if (typeof require !== 'function') throw new Error('Node.js entegrasyonu yok.');
     const fs   = require('fs');
     const path = require('path');
@@ -222,7 +260,7 @@ const APIManager = (() => {
 
       onProgress && onProgress(i / numChunks, `Parça ${i + 1}/${numChunks} Whisper'a gönderiliyor…`);
 
-      const chunkWords = await _sendToWhisper(chunkWav, apiKey, language, null);
+      const chunkWords = await _sendToWhisper(chunkWav, apiKey, language, null, cfg);
       chunkWords.forEach(w => {
         allWords.push({
           ...w,
@@ -397,7 +435,13 @@ const APIManager = (() => {
     });
   }
 
-  async function _sendToWhisper(filePath, apiKey, language, onProgress) {
+  /** Yerel motor (whisper.cpp) — bir sonraki adımda kurulacak. */
+  async function _transcribeLocal(filePath, language, totalDuration, onProgress) {
+    throw new Error('Yerel motor (whisper.cpp) henüz kurulmadı — bir sonraki adımda ekliyoruz. Şimdilik Motor olarak OpenAI veya Groq seçin.');
+  }
+
+  async function _sendToWhisper(filePath, apiKey, language, onProgress, cfg) {
+    cfg = cfg || ENGINES.openai;
     return new Promise((resolve, reject) => {
       (async () => {
         if (typeof require !== 'function') {
@@ -428,7 +472,7 @@ const APIManager = (() => {
         const boundary   = '----RastFlowAIBoundary' + Date.now();
 
         const parts = [];
-        parts.push(_fieldPart('model', MODEL, boundary));
+        parts.push(_fieldPart('model', cfg.model, boundary));
         parts.push(_fieldPart('response_format', 'verbose_json', boundary));
         parts.push(_fieldPart('timestamp_granularities[]', 'word', boundary));
         if (language && language !== 'auto') {
@@ -440,8 +484,8 @@ const APIManager = (() => {
         const bodyBuffer = Buffer.concat(parts.concat([bodyEnd]));
 
         const reqOptions = {
-          hostname: 'api.openai.com',
-          path    : '/v1/audio/transcriptions',
+          hostname: cfg.hostname,
+          path    : cfg.path,
           method  : 'POST',
           headers : {
             'Authorization': 'Bearer ' + cleanKey,
@@ -457,7 +501,7 @@ const APIManager = (() => {
             try {
               const data = JSON.parse(raw);
               if (data.error) {
-                reject(new Error('Whisper API: ' + data.error.message));
+                reject(new Error('Transkript API (' + cfg.hostname + '): ' + (data.error.message || JSON.stringify(data.error))));
                 return;
               }
 
@@ -471,7 +515,7 @@ const APIManager = (() => {
                 }));
               } else if (data.segments) {
                 data.segments.forEach(seg => {
-                  if (seg.words) {
+                  if (seg.words && seg.words.length) {
                     seg.words.forEach(w => {
                       words.push({
                         word : w.word,
@@ -480,11 +524,22 @@ const APIManager = (() => {
                         id   : _uid()
                       });
                     });
+                  } else if (seg.text) {
+                    // Kelime zaman damgası yoksa: segment metnini aralığa eşit dağıt
+                    const toks = String(seg.text).trim().split(/\s+/).filter(Boolean);
+                    const s = parseFloat(seg.start), e = parseFloat(seg.end);
+                    const step = ((e > s ? e - s : 0.3)) / Math.max(1, toks.length);
+                    toks.forEach((tk, k) => words.push({
+                      word : tk,
+                      start: parseFloat((s + k * step).toFixed(3)),
+                      end  : parseFloat((s + (k + 1) * step).toFixed(3)),
+                      id   : _uid()
+                    }));
                   }
                 });
               }
               if (words.length === 0) {
-                reject(new Error('Whisper kelime verisi döndürmedi. Ses dosyası boş veya sessiz olabilir.'));
+                reject(new Error('Transkript motoru kelime verisi döndürmedi. Ses boş/sessiz olabilir.'));
                 return;
               }
               words.forEach(w => { w.word = (w.word || '').trim(); });
@@ -602,7 +657,8 @@ const APIManager = (() => {
     }
   }
 
-  return { setApiKey, getApiKey, hasStoredKey, maskApiKey, transcribe, getLastWavPath, getLastWavOffset, cleanupLastWav, findFfmpeg: _findFfmpeg, encrypt: _encrypt, decrypt: _decrypt };
+  return { setApiKey, getApiKey, hasStoredKey, maskApiKey, transcribe, getLastWavPath, getLastWavOffset, cleanupLastWav, findFfmpeg: _findFfmpeg, encrypt: _encrypt, decrypt: _decrypt,
+           getEngine, setEngine, setGroqKey, getGroqKey, hasGroqKey, maskGroqKey: maskApiKey };
 })();
 
 
@@ -1695,7 +1751,7 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
       const https = require('https');
       const body  = Buffer.from(JSON.stringify(
         isAnthropic
-          ? { model, max_tokens: 4096, system: systemPrompt, messages: [{ role: 'user', content: userContent }] }
+          ? { model, max_tokens: 8192, system: systemPrompt, messages: [{ role: 'user', content: userContent }] }
           : { model, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }], response_format: { type: 'json_object' } }
       ));
 
@@ -1735,7 +1791,7 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
   async function _callApiFetch(apiKey, model, isAnthropic, systemPrompt, userContent, onStatus) {
     const url  = isAnthropic ? 'https://api.anthropic.com/v1/messages' : 'https://api.openai.com/v1/chat/completions';
     const body = isAnthropic
-      ? { model, max_tokens: 4096, system: systemPrompt, messages: [{ role: 'user', content: userContent }] }
+      ? { model, max_tokens: 8192, system: systemPrompt, messages: [{ role: 'user', content: userContent }] }
       : { model, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }], response_format: { type: 'json_object' } };
 
     const headers = {
@@ -1753,24 +1809,28 @@ SADECE şu JSON formatında yanıt ver, başka hiçbir açıklama yazma:
       : (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content);
   }
 
-  const ENHANCE_PROMPT = `Sen uzman bir Türkçe transkript editörüsün ve özellikle TIBBİ/teknik içeriklerde uzmansın. Sana bir konuşmanın ham Whisper transkripti, sıralı kelimeler [{id, word}] olarak verilecek.
+  const ENHANCE_PROMPT = `Sen uzman bir Türkçe transkript editörüsün ve özellikle TIBBİ/teknik içeriklerde uzmansın. Sana bir konuşmanın ham Whisper transkripti, sıralı kelimeler [{id, word}] olarak verilecek. Her kelime için (A) düzeltilmiş yazımı ve (B) caption blok sınırını döndür.
 
-Her kelimeyi DÜZELT:
-1) NOKTALAMA: Türkçe kurallarına uygun . , ? ! : ; … ekle; işareti ait olduğu kelimeye bitişik yaz. Soru ("mı/mi/mu/mü" veya soru sözcüğü) varsa "?" koy.
+A) DÜZELTME — her kelimenin "word" alanı:
+1) NOKTALAMA: Türkçe kurallarına uygun . , ? ! : ; … ekle; işareti kelimeye bitişik yaz. HER cümle bir noktalama işaretiyle BİTMELİ — noktalamayı ASLA atlama. Soru cümlelerine "?" koy.
 2) YAZIM & BÜYÜK HARF: Türkçe imla hatalarını düzelt, Türkçe karakterleri (ç ğ ı İ ö ş ü) doğru kullan, cümle başlarını ve özel adları büyük harfle başlat.
-3) TIBBİ/TEKNİK TERİMLER: Yanlış duyulmuş tıbbi/teknik terimleri doğru ve yaygın yazımıyla düzelt; uluslararası kısaltma ve terimleri doğru biçimde (genelde İngilizce/Latince) yaz. Örnekler:
-   - "pikos" / "pe ce o es" → "PCOS"
-   - "em ar" → "MR", "be te" → "BT", "u es ge" → "USG", "te se ha" → "TSH", "ef es ha" → "FSH", "ha ce ge" → "hCG"
-   - hormon/ilaç/anatomi adlarını doğru yaz (örn. "östrojen", "progesteron", "endometrium").
-   Terimi YALNIZCA bağlam gerçekten tıbbi/teknik olduğunda değiştir; günlük kelimeleri zorlama.
+3) TIBBİ/TEKNİK TERİMLER: Yanlış duyulmuş terimleri doğru, yaygın ve uluslararası (genelde İngilizce/Latince) yazımıyla düzelt:
+   - "siminir/simir/sivayır/sıvayır" → "smear"; "pap simir" → "Pap smear"
+   - "rehmaz/rahimağzı" → "rahim ağzı"; "kanser tarınması" → "kanser taraması"
+   - "pikos/pe ce o es" → "PCOS", "em ar" → "MR", "be te" → "BT", "u es ge" → "USG", "te se ha" → "TSH"
+   - hormon/ilaç/anatomi adlarını doğru yaz (örn. "östrojen", "endometrium").
+   Terimi yalnızca bağlam tıbbi/teknik olduğunda değiştir.
+
+B) BÖLME — caption blok sınırı, "br" alanı:
+Konuşmayı ANLAMLI caption bloklarına böl. Her blok bir cümle ya da anlamlı bir cümle parçası olsun; yaklaşık 3-8 kelime, EN FAZLA ~42 karakter. Bir bloğun SON kelimesinde "br": true ver (diğerlerinde verme). Bloğu cümle/virgül/anlam sınırından kes; ASLA kelimenin ortasından veya rastgele karakterde kesme.
 
 KURALLAR:
-- Anlamı KORU. Kelime ekleme veya sırasını değiştirme YOK. Mevcut anlamı bozma.
-- Bir terim birden fazla kelimeden tek terime İNİYORSA (örn. "poli kistik over sendromu" → "PCOS"): düzeltilmiş tam terimi DİZİDEKİ İLK kelimeye yaz, birleşen diğer kelimeler için word'ü "" (boş dize) döndür.
-- Gönderilen id'leri AYNEN koru (string olarak, değiştirme).
+- Anlamı KORU. Kelime ekleme veya sırasını değiştirme YOK.
+- Bir terim çok kelimeden tek terime iniyorsa (örn. "poli kistik over sendromu" → "PCOS"): terimi DİZİDEKİ İLK kelimeye yaz, birleşenleri "" (boş) yap; "br"yi birleşen boş kelimeye KOYMA.
+- Gönderilen id'leri AYNEN koru.
 
 SADECE şu JSON ile yanıt ver, başka açıklama yazma:
-{"words":[{"id":"<id>","word":"<düzeltilmiş kelime ya da '' (birleşme)>"}]}`;
+{"words":[{"id":"<id>","word":"<düzeltilmiş>","br":true}]}  // br yalnızca blok sonu kelimelerde`;
 
   /** AI Editör anahtarı yoksa Whisper (OpenAI) anahtarına düş. */
   function _resolveKeyModel() {
@@ -1778,10 +1838,9 @@ SADECE şu JSON ile yanıt ver, başka açıklama yazma:
     let apiKey = (s.apiKey || '').trim();
     let model  = s.model || '';
     if (!apiKey && typeof APIManager !== 'undefined' && APIManager.getApiKey) {
-      apiKey = APIManager.getApiKey();
-      if (!model) model = 'gpt-4o-mini';
+      apiKey = APIManager.getApiKey();           // Whisper (OpenAI) anahtarına düş
     }
-    if (!model) model = 'gpt-4o-mini';
+    if (!model) model = 'gpt-4o';                // kaliteli düzeltme için varsayılan
     return { apiKey, model, isAnthropic: model.indexOf('claude') === 0 };
   }
 
@@ -1810,7 +1869,19 @@ SADECE şu JSON ile yanıt ver, başka açıklama yazma:
       throw new Error('AI yanıtı çözümlenemedi: ' + String(responseText).slice(0, 200));
     }
     const items = parsed.words || parsed.items || [];
-    return TranscriptStore.applyCorrections(items);   // { updated, removed }
+    const total = items.length;
+
+    // 1) Metin düzeltmeleri (+ birleşmeler) — tek undo
+    const { updated, removed } = TranscriptStore.applyCorrections(items);
+
+    // 2) AI'nın işaretlediği anlamlı blok sınırlarını uygula (boş/birleşen kelimeler hariç)
+    const isBreak = v => v === true || v === 1 || v === 'true';
+    const breakIds = items
+      .filter(it => isBreak(it.br) && String(it.word || '').trim() !== '')
+      .map(it => String(it.id));
+    if (breakIds.length) TranscriptStore.setSegmentBreaks(breakIds);
+
+    return { updated, removed, total, segCount: breakIds.length };
   }
 
   function getReasons() { return _reasons; }
@@ -1981,12 +2052,24 @@ const SubtitleEngine = (() => {
     const segmented = TranscriptStore.getSegmentedWords();
     if (segmented.length === 0) throw new Error('Transkript boş. Önce transkript oluşturun.');
 
-    // Native caption track → satır bazlı düz metin (maks ~8 kelime / 42 karakter)
+    // Animasyonlu altyazı (MOGRT) → satır bazlı metin segmentleri
     const segments = _buildCaptionSegments(segmented);
+
+    // Eklenti yolunu CLIENT tarafından güvenilir biçimde al ($.fileName JSX'te güvenilmez)
+    let mogrtPath = '';
+    try {
+      const csp = window.getCSInterface ? window.getCSInterface() : null;
+      if (csp) {
+        const extRoot = csp.getSystemPath(window.SystemPath ? window.SystemPath.EXTENSION : 'extension');
+        if (extRoot) mogrtPath = extRoot.replace(/\\/g, '/') + '/templates/caption.mogrt';
+      }
+    } catch (e) {}
+
+    const options = { allCaps: _style.allCaps, mogrtPath };
 
     return new Promise((resolve, reject) => {
       const cs = window.getCSInterface ? window.getCSInterface() : null;
-      const script = `createCaptionTrackFromSegments(${JSON.stringify(JSON.stringify(segments))})`;
+      const script = `createCaptionGraphicsFromMogrt(${JSON.stringify(JSON.stringify(segments))}, ${JSON.stringify(JSON.stringify(options))})`;
       if (cs) {
         cs.evalScript(script, result => {
           try { resolve(JSON.parse(result)); }
@@ -2163,6 +2246,52 @@ const UIController = (() => {
       });
     }
 
+    // Transkript motoru seçimi
+    const engineSel = document.getElementById('engineSelect');
+    const showEngineFields = (eng) => {
+      document.querySelectorAll('.engine-field').forEach(f => {
+        f.style.display = (f.dataset.engine === eng) ? 'block' : 'none';
+      });
+    };
+    if (engineSel) {
+      engineSel.value = APIManager.getEngine();
+      showEngineFields(engineSel.value);
+      engineSel.addEventListener('change', () => {
+        APIManager.setEngine(engineSel.value);
+        showEngineFields(engineSel.value);
+        log('Transkript motoru: ' + engineSel.value, 'info');
+      });
+    }
+
+    // Groq anahtarı
+    const groqInput = document.getElementById('groqKeyInput');
+    const groqSave  = document.getElementById('groqKeySave');
+    const groqShow  = document.getElementById('groqKeyToggle');
+    const groqDot   = document.getElementById('groqStatusDot');
+    if (groqInput && APIManager.hasGroqKey()) {
+      groqInput.value = APIManager.maskApiKey(APIManager.getGroqKey());
+      if (groqDot) groqDot.className = 'status-dot ok';
+    }
+    if (groqSave) {
+      groqSave.addEventListener('click', () => {
+        const k = (groqInput?.value || '').trim();
+        if (!k || k.indexOf('•') >= 0) { toast('Yeni bir Groq anahtarı yapıştırın.', 'warn'); return; }
+        APIManager.setGroqKey(k);
+        const saved = APIManager.getGroqKey();
+        if (saved) {
+          groqInput.value = APIManager.maskApiKey(saved);
+          if (groqDot) groqDot.className = 'status-dot ok';
+          toast('Groq anahtarı kaydedildi. 🔒', 'success');
+        } else { toast('Groq anahtarı geçersiz.', 'error'); }
+      });
+    }
+    if (groqShow) {
+      groqShow.addEventListener('click', () => {
+        if (groqInput.type === 'password') { groqInput.type = 'text'; groqShow.textContent = '🙈'; }
+        else { groqInput.type = 'password'; groqShow.textContent = '👁'; }
+      });
+    }
+
     // Transkript et
     const transcribeBtn = document.getElementById('transcribeBtn');
     if (transcribeBtn) transcribeBtn.addEventListener('click', _onTranscribeClick);
@@ -2192,7 +2321,10 @@ const UIController = (() => {
     if (settingsClose)    settingsClose.addEventListener('click', closeDrawer);
     if (settingsBackdrop) settingsBackdrop.addEventListener('click', closeDrawer);
 
-    if (!APIManager.hasStoredKey()) setTimeout(openDrawer, 400);
+    const _eng = APIManager.getEngine();
+    const _needsKey = (_eng === 'openai' && !APIManager.hasStoredKey()) ||
+                      (_eng === 'groq'   && !APIManager.hasGroqKey());
+    if (_needsKey) setTimeout(openDrawer, 400);
 
     // Sessizlik tara
     const scanSilenceBtn = document.getElementById('scanSilenceBtn');
@@ -2681,13 +2813,27 @@ const UIController = (() => {
     _showLoading(true);
     try {
       const lt = document.getElementById('loadingText');
-      const { updated, removed } = await AIEditorEngine.enhanceTranscriptWithAI((msg) => { if (lt) lt.textContent = msg; });
+      const { updated, removed, total, segCount } = await AIEditorEngine.enhanceTranscriptWithAI((msg) => { if (lt) lt.textContent = msg; });
 
-      if (lt) lt.textContent = 'Cümle cümle bölünüyor…';
-      const n = SubtitleEngine.autoSegmentSubtitles();
+      // AI hiç sonuç döndürmediyse: net uyar + yine de ücretsiz bölmeyi uygula
+      if (!total) {
+        const n = SubtitleEngine.autoSegmentSubtitles();
+        toast(`AI sonuç döndürmedi (model/anahtar?). Karakter bazlı ${n + 1} bloğa bölündü.`, 'warn');
+        log('AI Düzelt: model boş yanıt döndürdü; ücretsiz bölmeye düşüldü.', 'warn');
+        return;
+      }
 
-      toast(`AI düzeltme tamam: ${updated} kelime düzeltildi${removed ? ', ' + removed + ' birleştirildi' : ''} · ${n + 1} bloğa bölündü.`, 'success');
-      log(`AI Düzelt: ${updated} güncellendi, ${removed} birleştirildi, ${n} kesim noktası.`, 'success');
+      // AI anlamlı blok sınırı verdiyse onu kullan; vermediyse cümle/karakter heuristiğine düş
+      let blocks = segCount;
+      if (segCount === 0) {
+        if (lt) lt.textContent = 'Cümle cümle bölünüyor…';
+        blocks = SubtitleEngine.autoSegmentSubtitles();
+      }
+
+      const segNote = segCount ? 'anlamlı' : 'cümle';
+      toast(`AI Düzelt tamam: ${updated} kelime düzeltildi${removed ? ', ' + removed + ' birleştirildi' : ''} · ${blocks + 1} ${segNote} bloğa bölündü.`,
+        updated > 0 ? 'success' : 'warn');
+      log(`AI Düzelt: ${updated} güncellendi, ${removed} birleştirildi, ${segCount} AI sınırı (${total} kelime).`, 'success');
     } catch (e) {
       toast('AI Düzelt hatası: ' + e.message, 'error');
       log('AI Düzelt hatası: ' + e.message, 'error');
@@ -2823,14 +2969,19 @@ const UIController = (() => {
     _showLoading(true);
     try {
       const result = await SubtitleEngine.injectToTimeline();
-      if (result.success && result.placedOnTimeline) {
-        toast(`${result.segmentCount} altyazı caption track'e eklendi ✓`, 'success');
-        log(`Caption track oluşturuldu: ${result.segmentCount} altyazı.`, 'success');
-      } else if (result.success && !result.placedOnTimeline) {
-        toast(result.note || 'SRT projeye aktarıldı — caption track\'e manuel sürükleyin.', 'warn');
-        log('Caption: ' + (result.note || 'projeye aktarıldı, manuel yerleştirme gerekiyor.'), 'warn');
+      if (result.success && result.createdCount > 0) {
+        toast(`${result.createdCount}/${result.total} animasyonlu altyazı V${result.trackIndex + 1}'e eklendi ✓`, 'success');
+        log(`MOGRT enjeksiyonu: ${result.createdCount}/${result.total} klip · metin yöntemi: ${result.textMethod}` +
+            (result.note ? ' · not: ' + result.note : ''), 'success');
+        if (result.textMethod === 'none') {
+          toast('Klipler kondu ama METİN doldurulamadı — şablon parametreleri Günlük\'e yazıldı.', 'warn');
+          log('MOGRT parametreleri: ' + (result.paramDiag || '(yok)'), 'warn');
+        }
+      } else if (result.success && result.createdCount === 0) {
+        toast('Hiç klip oluşturulamadı: ' + (result.note || 'bilinmeyen'), 'warn');
+        log('MOGRT 0 klip. Not: ' + (result.note || '—'), 'warn');
       } else {
-        toast('Caption hatası: ' + result.error, 'error');
+        toast('Altyazı hatası: ' + result.error, 'error');
         log('Hata: ' + result.error, 'error');
       }
     } catch (e) {
@@ -3119,13 +3270,49 @@ const UIController = (() => {
 
   function _timeNow() { return new Date().toTimeString().slice(0, 8); }
 
+  /** Panoya kopyala — CEP file:// bağlamında Clipboard API çalışmaz, execCommand'a düşer. */
+  function copyText(text) {
+    text = String(text == null ? '' : text);
+    if (!text) { toast('Kopyalanacak metin yok.', 'info'); return; }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+        navigator.clipboard.writeText(text)
+          .then(() => toast('Panoya kopyalandı.', 'success'))
+          .catch(() => _copyFallback(text));
+        return;
+      }
+    } catch (e) {}
+    _copyFallback(text);
+  }
+
+  function _copyFallback(text) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      toast(ok ? 'Panoya kopyalandı.' : 'Kopyalanamadı (tarayıcı izni reddetti).', ok ? 'success' : 'error');
+    } catch (e) {
+      toast('Kopyalanamadı: ' + e.message, 'error');
+    }
+  }
+
   function _fmt(sec) {
     const m = Math.floor(sec / 60);
     const s = Math.floor(sec % 60);
     return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   }
 
-  return { init, updateStats, toggleSilenceQueue, isSilenceQueued, log, toast };
+  return { init, updateStats, toggleSilenceQueue, isSilenceQueued, log, toast, copyText };
 })();
 
 /* ── DOM Hazır ── */
@@ -3142,8 +3329,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnCopy = document.getElementById('btnCopyText');
   if(btnCopy) btnCopy.addEventListener('click', () => {
     const t=Array.from(document.querySelectorAll('.word')).map(w=>w.textContent).join(' ');
-    navigator.clipboard.writeText(t); 
-    if(typeof UIController !== 'undefined') UIController.toast('Panoya kopyalandı.','success');
+    UIController.copyText(t);
   });
 
   const posX = document.getElementById('positionXInput');

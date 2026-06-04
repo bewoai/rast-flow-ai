@@ -709,6 +709,177 @@ function _findImportedItem(baseName) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+   5c. createCaptionGraphicsFromMogrt() — Animasyonlu Altyazı (MOGRT)
+   Her segment için templates/caption.mogrt'ı timeline'a koyar, metnini
+   doldurur. Stil + animasyon ŞABLONUN içinde gelir (her kopya oynatır).
+   ══════════════════════════════════════════════════════════════════ */
+
+function createCaptionGraphicsFromMogrt(segmentsJSON, optionsJSON) {
+  try {
+    app.userInputDisabled = true;
+
+    var segments = JSON.parse(segmentsJSON);
+    var opts     = optionsJSON ? JSON.parse(optionsJSON) : {};
+    if (!segments || !segments.length) {
+      app.userInputDisabled = false;
+      return JSON.stringify({ success: false, error: "Segment verisi boş." });
+    }
+
+    var seq = app.project.activeSequence;
+    if (!seq) { app.userInputDisabled = false; return JSON.stringify({ success: false, error: "Aktif sekans bulunamadı." }); }
+
+    // 1) Client'ın CSInterface ile verdiği yol (güvenilir) — 2) $.fileName tahmini (yedek)
+    var mogrtPath = "";
+    if (opts && opts.mogrtPath) {
+      try { var mf = new File(opts.mogrtPath); if (mf.exists) mogrtPath = mf.fsName; } catch (eMf) {}
+    }
+    if (!mogrtPath) mogrtPath = _findMogrt();
+    if (!mogrtPath) {
+      app.userInputDisabled = false;
+      var tried = (opts && opts.mogrtPath) ? opts.mogrtPath : "templates/caption.mogrt";
+      return JSON.stringify({
+        success: false,
+        error: "MOGRT şablonu bulunamadı: " + tried + " — dosyanın tam olarak burada olduğundan emin ol."
+      });
+    }
+
+    var vCount     = seq.videoTracks.numTracks;
+    var trackIndex = (opts.trackIndex !== undefined && opts.trackIndex < vCount) ? opts.trackIndex : (vCount - 1);
+
+    var created = 0, textMethod = "none", firstErr = "";
+    var firstClip = null;
+
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      var s = parseFloat(seg.start), e = parseFloat(seg.end);
+      if (!(e > s)) continue;
+
+      try {
+        var t = new Time(); t.seconds = s;
+        var clip = null;
+        try { clip = seq.importMGT(mogrtPath, t.ticks, trackIndex, 0); } catch (eImp) { if (!firstErr) firstErr = "importMGT: " + eImp.message; }
+        if (!clip) clip = _findClipAtSec(seq.videoTracks[trackIndex], s);
+        if (!clip) { if (!firstErr) firstErr = "importMGT klip döndürmedi"; continue; }
+        if (!firstClip) firstClip = clip;
+
+        // Süreyi segmente ayarla
+        try { var te = new Time(); te.seconds = e; clip.end = te; } catch (eDur) {}
+
+        // Metni doldur
+        var mm = _setMogrtText(clip, seg.text || "");
+        if (mm && textMethod === "none") textMethod = mm;
+
+        created++;
+      } catch (eSeg) { if (!firstErr) firstErr = eSeg.message; }
+    }
+
+    // Metin doldurulamadıysa: şablonun parametre adlarını teşhis için döndür
+    var paramDiag = "";
+    if (textMethod === "none" && firstClip) paramDiag = _mogrtParamNames(firstClip);
+
+    app.userInputDisabled = false;
+    return JSON.stringify({
+      success     : true,
+      createdCount: created,
+      total       : segments.length,
+      trackIndex  : trackIndex,
+      textMethod  : textMethod,
+      paramDiag   : paramDiag,
+      note        : firstErr
+    });
+
+  } catch (e) {
+    try { app.userInputDisabled = false; } catch (e2) {}
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/** Eklentinin templates/ klasöründe caption.mogrt'ı bulur. */
+function _findMogrt() {
+  try {
+    var extDir = new File($.fileName).parent.parent; // host/.. → kök
+    var candidates = [
+      extDir.absoluteURI + "/templates/caption.mogrt",
+      extDir.absoluteURI + "/caption.mogrt",
+      extDir.absoluteURI + "/templates/Caption.mogrt"
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      var f = new File(candidates[i]);
+      if (f.exists) return f.fsName;
+    }
+  } catch (e) {}
+  return null;
+}
+
+/** Bir track'te başlangıcı verilen saniyeye en yakın klibi bul (importMGT null dönerse). */
+function _findClipAtSec(track, sec) {
+  if (!track) return null;
+  var best = null, bestDiff = 0.06;
+  for (var c = 0; c < track.clips.numItems; c++) {
+    var cl = track.clips[c];
+    var d = Math.abs(_toSeconds(cl.start) - sec);
+    if (d < bestDiff) { bestDiff = d; best = cl; }
+  }
+  return best;
+}
+
+/** MOGRT klibinin metin parametresini doldur — çoklu strateji + teşhis döndürür. */
+function _setMogrtText(clip, text) {
+  try {
+    var mgt = (clip.getMGTComponent) ? clip.getMGTComponent() : null;
+    if (mgt && mgt.properties) {
+      var props = mgt.properties;
+      var n = props.numItems;
+
+      // 1) Adı "text/metin/source/kaynak/title/altyazı" geçen parametre
+      for (var i = 0; i < n; i++) {
+        var p  = props[i];
+        var dn = String(p.displayName || "").toLowerCase();
+        if (dn.indexOf("text") >= 0 || dn.indexOf("metin") >= 0 || dn.indexOf("source") >= 0 ||
+            dn.indexOf("kaynak") >= 0 || dn.indexOf("title") >= 0 || dn.indexOf("altyaz") >= 0) {
+          if (_trySetProp(p, text)) return "param:" + p.displayName;
+        }
+      }
+      // 2) Metin gibi davranan ilk parametre (string kabul eden)
+      for (var j = 0; j < n; j++) {
+        if (_trySetProp(props[j], text)) return "first-string:" + (props[j].displayName || j);
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+function _trySetProp(p, text) {
+  // Düz string
+  try { p.setValue(text, true); return true; } catch (e1) {}
+  // TextDocument benzeri nesne
+  try {
+    var v = p.getValue();
+    if (v && typeof v === "object") { v.text = text; p.setValue(v, true); return true; }
+  } catch (e2) {}
+  return false;
+}
+
+/** Teşhis: MOGRT klibinin parametre adlarını listele (metin dolmazsa). */
+function _mogrtParamNames(clip) {
+  try {
+    if (!clip.getMGTComponent) return "getMGTComponent metodu yok (klip MGT değil)";
+    var mgt = clip.getMGTComponent();
+    if (!mgt) return "getMGTComponent null döndü (klip MGT değil)";
+    if (!mgt.properties) return "MGT properties yok";
+    var n = mgt.properties.numItems;
+    var out = ["(" + n + " param)"];
+    for (var i = 0; i < n && i < 25; i++) {
+      var p = mgt.properties[i];
+      var nm = "?";
+      try { nm = String(p.displayName); } catch (e1) {}
+      out.push(i + ":'" + nm + "'");
+    }
+    return out.join(" ");
+  } catch (e) { return "teşhis hatası: " + e.message; }
+}
+
+/* ══════════════════════════════════════════════════════════════════
    6. createSubtitleGraphicClips() — Essential Graphics Enjeksiyon Motoru
    ══════════════════════════════════════════════════════════════════ */
 
