@@ -14,6 +14,7 @@
   <div class="header">
     <img src="./assets/logo.png" alt="Rast Flow AI" class="header-logo-img" id="headerLogo">
     <div class="header-spacer"></div>
+    <div class="icon-btn" id="reloadBtn" title="Paneli yenile" role="button" tabindex="0" aria-label="Paneli Yenile">↻</div>
     <div class="icon-btn" id="settingsBtn" title="Ayarlar" role="button" tabindex="0" aria-label="Ayarlar">⚙</div>
   </div>
 
@@ -36,6 +37,7 @@
       <button class="btn btn-secondary btn-sm" id="btnSelectAll" title="Tümünü seç">☑</button>
       <button class="btn btn-secondary btn-sm" id="btnClearSelect" title="Seçimi temizle">☐</button>
       <button class="btn btn-secondary btn-sm" id="btnCopyText" title="Kopyala">⧉</button>
+      <button class="btn btn-secondary btn-sm" id="historyBtn" title="Transkript geçmişi (son 5)">📚</button>
       <div class="silence-control">
         <span>Sessizlik</span>
         <input type="number" id="silenceThreshold" value="0.4" min="0.1" max="5" step="0.1">
@@ -53,6 +55,15 @@
     </div>
 
     <div class="progress-bar" style="margin:0 16px 10px;"><div class="progress-fill"></div></div>
+
+    <!-- Transkript Geçmişi (açılır panel) -->
+    <div class="history-panel" id="historyPanel">
+      <div class="history-head">
+        <span>📚 Transkript Geçmişi — son 5</span>
+        <span class="history-close" id="historyClose" role="button" tabindex="0" title="Kapat">✕</span>
+      </div>
+      <div class="history-list" id="historyList"></div>
+    </div>
 
     <div class="transcript-wrap">
       <div class="transcript-area" id="transcriptArea">
@@ -166,7 +177,8 @@
         <div class="subtitle-preview" id="subtitlePreviewContainer">
           <div class="subtitle-preview-text" id="subtitlePreviewText">Kelime <span class="hl">kelime</span> animasyon</div>
         </div>
-        <div class="hint" style="text-align:center;">Önizlemedeki metni fareyle sürükleyerek de konumlandırabilirsiniz.</div>
+        <button class="btn btn-secondary btn-sm btn-full" id="loadFrameBtn" style="margin-top:8px;">🎬 Playhead'den Kare Yükle</button>
+        <div class="hint" style="text-align:center;">Gerçek video karesi sekans çözünürlüğünde gösterilir. Metni fareyle sürükleyerek konumlandırabilirsiniz.</div>
       </div>
 
       <div class="section">
@@ -330,6 +342,16 @@
               <input type="range" id="bgOpacityInput" min="0" max="100" value="75">
             </div>
           </div>
+          <div class="row" style="margin-top:8px;">
+            <div class="field">
+              <label>Yuvarlaklık: <span id="bgRadiusLabel">30</span>%</label>
+              <input type="range" id="bgRadiusInput" min="0" max="100" value="30">
+            </div>
+            <div class="field">
+              <label>Dolgu (boyut): <span id="bgPaddingLabel">40</span>%</label>
+              <input type="range" id="bgPaddingInput" min="0" max="120" value="40">
+            </div>
+          </div>
         </div>
 
         <div class="field" style="margin-top:8px;">
@@ -346,12 +368,14 @@
       </div>
 
       <!-- Dışa Aktarma Butonları -->
+      <button class="btn btn-primary btn-full" id="injectTimelineBtn" style="margin-bottom:6px;">✨ Stilli Altyazı Bas (görüntü)</button>
       <div class="btn-group" style="margin-bottom:8px;">
-        <button class="btn btn-primary btn-full" id="injectTimelineBtn" style="flex:1.2;">✨ Animasyonlu Altyazı</button>
+        <button class="btn btn-secondary btn-full" id="editableCaptionsBtn" style="flex:1.3;">📝 Düzenlenebilir Altyazı</button>
         <button class="btn btn-success btn-full" id="generateSubtitlesBtn" style="flex:1;">📄 SRT İndir</button>
       </div>
       <div class="hint" style="text-align:center;">
-        <b>Animasyonlu Altyazı</b>: <code>templates/caption.mogrt</code> şablonunu her altyazı için timeline'a koyar (stil + animasyon şablondan gelir).<br>
+        <b>Stilli Altyazı (görüntü)</b>: Önizlemedeki stille (font/renk/kutu/konum) görüntü olarak basar — birebir görünür ama <u>düzenlenemez</u>. Tarz → Dinamik = karaoke.<br>
+        <b>Düzenlenebilir Altyazı</b>: Premiere'in yerel caption track'ine koyar — <u>çift tıkla metni düzenlersin</u>, stili Premiere'de verirsin.<br>
         <b>SRT İndir</b>: Harici .srt dosyası üretir.
       </div>
 
@@ -515,7 +539,10 @@
     </div>
 
     <div class="section">
-      <div class="section-title">Günlük</div>
+      <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <span>Günlük</span>
+        <button class="btn btn-secondary btn-sm" id="logCopyBtn" title="Tüm günlüğü panoya kopyala" style="padding:3px 10px;font-size:11px;">📋 Kopyala</button>
+      </div>
       <div id="logPanel" class="log-panel"></div>
     </div>
 

@@ -22,6 +22,7 @@ const APIManager = (() => {
   let _apiKey = '';
   let _lastWavPath = '';
   let _lastWavOffset = 0;
+  let _ffmpegPath = '';   // _findFfmpeg'in çözdüğü yol (teşhis)
 
   /** Cihaza özgü AES-256 şifreleme anahtarı üret (hostname + kullanıcı türevli) */
   function _getDeviceKey() {
@@ -285,7 +286,9 @@ const APIManager = (() => {
     try {
       return await _concatWithFfmpeg(segments, rangeStart, rangeEnd, onProgress);
     } catch (ffErr) {
-      // FFmpeg yok/başarısız → WebAudio ile çoklu klip birleştirme (bağımsız, dosyasız)
+      // FFmpeg başarısız → nedeni LOG'la (sessiz yutma yok), sonra WebAudio dene
+      try { UIController.log('FFmpeg ses çıkarma başarısız (yol: ' + (_ffmpegPath || '?') + ') → WebAudio deneniyor: ' + ffErr.message, 'warn'); } catch (e) {}
+      try { console.warn('[RastFlow] FFmpeg fallback:', ffErr); } catch (e) {}
       return await _buildTimelineWavWebAudio(segments, rangeStart, rangeEnd, onProgress);
     }
   }
@@ -305,6 +308,15 @@ const APIManager = (() => {
     const cache = {};
     async function getDecoded(p) {
       if (cache[p]) return cache[p];
+      // WebAudio tüm dosyayı belleğe alır → büyük dosyalar Node'un ~2GB Buffer
+      // sınırına çarpar. FFmpeg (seek'li) bu sınırı tanımaz; net yönlendir.
+      try {
+        const sz = fs.statSync(p).size;
+        if (sz > 1.8 * 1024 * 1024 * 1024) {
+          throw new Error('Kaynak medya çok büyük (' + (sz / 1073741824).toFixed(1) +
+            ' GB) — WebAudio sınırı. FFmpeg lib/ffmpeg/ffmpeg.exe ile çıkarılmalı (kurulu olmalı).');
+        }
+      } catch (eSz) { if (eSz.message.indexOf('çok büyük') >= 0) throw eSz; }
       const buf      = await fs.promises.readFile(p);
       const arrayBuf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
       const ctx      = new AC();
@@ -586,25 +598,34 @@ const APIManager = (() => {
       const isWin = (navigator.platform || '').toLowerCase().indexOf('win') >= 0;
       const bin   = isWin ? 'ffmpeg.exe' : 'ffmpeg';
 
-      let extRoot = '';
+      // Eklenti kökünü iki yoldan türet (biri güvenilmezse diğeri tutar)
+      const roots = [];
       try {
         const cs = window.getCSInterface ? window.getCSInterface() : null;
-        if (cs) extRoot = cs.getSystemPath(window.SystemPath ? window.SystemPath.EXTENSION : 'extension');
+        if (cs) { const r = cs.getSystemPath(window.SystemPath ? window.SystemPath.EXTENSION : 'extension'); if (r) roots.push(r); }
+      } catch (e) {}
+      try {
+        // file:///C:/.../com.pr.workflow/client/index.html → .../com.pr.workflow
+        let p = decodeURIComponent(String(window.location.href || '').replace(/^file:\/+/i, ''));
+        p = p.replace(/[\/\\]client[\/\\][^\/\\]*$/i, '');
+        if (p) roots.push(p);
       } catch (e) {}
 
       const candidates = [];
-      if (extRoot) {
-        candidates.push(path.join(extRoot, 'lib', 'ffmpeg', bin));
-        candidates.push(path.join(extRoot, 'lib', bin));
-      }
+      roots.forEach(r => {
+        candidates.push(path.join(r, 'lib', 'ffmpeg', bin));
+        candidates.push(path.join(r, 'lib', bin));
+      });
       for (const c of candidates) {
         try {
           if (fs.existsSync(c)) {
             if (!isWin) { try { fs.chmodSync(c, 0o755); } catch (e) {} }
+            _ffmpegPath = c;
             return c;
           }
         } catch (e) {}
       }
+      _ffmpegPath = bin + ' (PATH — bulunamadı, sistemde aranacak)';
       return bin;
     } catch (e) { return null; }
   }
@@ -675,7 +696,9 @@ const TranscriptStore = (() => {
     _words    = wordsArray.map(w => ({ ...w, deleted: false, filler: false, repeat: false }));
     _segments = [];
     _undoStack = [];
+    _sessionId = _uid() + _uid();   // her yeni transkript = yeni geçmiş oturumu
     _notify();
+    _persistSession();              // hemen geçmişe yaz
   }
 
   // Tam anlık görüntü — silme/ekleme/taşıma dahil her tür düzenlemeyi geri alır.
@@ -887,6 +910,41 @@ const TranscriptStore = (() => {
     w.moved = true;
   }
 
+  /** Kelimeyi bir ÜST satıra (caption bloğuna) taşı. Satır başı kelimesi için geçerli. */
+  function moveWordToPrevLine(id) {
+    const active = _words.filter(w => !w.deleted);
+    const idx = active.findIndex(w => w.id === id);
+    if (idx <= 0) return false;                       // ilk kelime, üstü yok
+    const prev = active[idx - 1];
+    // Bu kelime satır başı mı? (önünde break = prev'ten sonra break)
+    if (!_segments.some(s => s.afterWordId === prev.id)) return false; // zaten üst kelimeyle aynı satırda
+    const next = active[idx + 1];
+    pushUndo();
+    _segments = _segments.filter(s => s.afterWordId !== prev.id);       // önceki break'i kaldır → kelime üste geçer
+    if (next && !_segments.some(s => s.afterWordId === id)) {           // kalan kelimeler alt satırda kalsın
+      _segments.push({ afterWordId: id, id: _uid() });
+    }
+    _notify();
+    return true;
+  }
+
+  /** Kelimeyi bir ALT satıra (caption bloğuna) taşı. Satır sonu kelimesi için geçerli. */
+  function moveWordToNextLine(id) {
+    const active = _words.filter(w => !w.deleted);
+    const idx = active.findIndex(w => w.id === id);
+    if (idx < 0 || idx >= active.length - 1) return false;             // son kelime, altı yok
+    // Bu kelime satır sonu mu? (arkasında break var mı)
+    if (!_segments.some(s => s.afterWordId === id)) return false;       // zaten alt kelimeyle aynı satırda
+    const prev = active[idx - 1];
+    pushUndo();
+    _segments = _segments.filter(s => s.afterWordId !== id);            // kendi sonundaki break'i kaldır → alt satıra iner
+    if (prev && !_segments.some(s => s.afterWordId === prev.id)) {      // önceki kelimeler üst satırda kalsın
+      _segments.push({ afterWordId: prev.id, id: _uid() });
+    }
+    _notify();
+    return true;
+  }
+
   function addSegmentBreak(afterWordId) {
     if (!_segments.find(s => s.afterWordId === afterWordId)) {
       _segments.push({ afterWordId, id: _uid() });
@@ -980,16 +1038,64 @@ const TranscriptStore = (() => {
 
   function onChange(fn) { _listeners.push(fn); }
   function notifyAll()  { _notify(); }
-  function _notify()    { _listeners.forEach(fn => fn(_words, _segments)); }
+  function _notify()    { _listeners.forEach(fn => fn(_words, _segments)); _scheduleSave(); }
   function _uid()       { return Math.random().toString(36).slice(2, 9); }
+
+  /* ── Transkript Geçmişi — son 5, localStorage (her oturum debounce'lu kaydedilir) ── */
+  const _HISTORY_KEY = 'rfai_transcript_history_v1';
+  const _MAX_HISTORY = 5;
+  let _sessionId = null;
+  let _saveTimer = null;
+
+  function _loadHist()  { try { return JSON.parse(localStorage.getItem(_HISTORY_KEY) || '[]'); } catch (e) { return []; } }
+  function _writeHist(a){ try { localStorage.setItem(_HISTORY_KEY, JSON.stringify(a.slice(0, _MAX_HISTORY))); } catch (e) {} }
+
+  function _persistSession() {
+    if (!_sessionId || !_words.length) return;
+    const hist = _loadHist();
+    const i = hist.findIndex(h => h.id === _sessionId);
+    const active = _words.filter(w => !w.deleted);
+    const entry = {
+      id       : _sessionId,
+      ts       : Date.now(),
+      preview  : active.slice(0, 10).map(w => w.word).join(' '),
+      wordCount: active.length,
+      words    : _words.map(w => ({ id: w.id, word: w.word, start: w.start, end: w.end, deleted: !!w.deleted, filler: !!w.filler, repeat: !!w.repeat })),
+      segments : _segments.map(s => ({ afterWordId: s.afterWordId, id: s.id }))
+    };
+    if (i >= 0) hist.splice(i, 1);   // varsa eski konumdan çıkar
+    hist.unshift(entry);             // en yeni başa
+    _writeHist(hist);
+  }
+  function _scheduleSave() {
+    if (_saveTimer) clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(_persistSession, 1000);
+  }
+
+  function getHistory() {
+    return _loadHist().map(h => ({ id: h.id, ts: h.ts, preview: h.preview, wordCount: h.wordCount || (h.words ? h.words.length : 0) }));
+  }
+  function restoreFromHistory(id) {
+    const e = _loadHist().find(h => h.id === id);
+    if (!e) return false;
+    _words    = (e.words || []).map(w => ({ ...w, deleted: !!w.deleted, filler: !!w.filler, repeat: !!w.repeat }));
+    _segments = (e.segments || []).map(s => ({ ...s }));
+    _undoStack = [];
+    _sessionId = id;   // bu oturumu düzenlemeye devam et
+    _notify();
+    return true;
+  }
+  function deleteFromHistory(id) { _writeHist(_loadHist().filter(h => h.id !== id)); }
 
   return {
     load, getWords, getSegments, updateWord, deleteWord, restoreWord,
     markFiller, markRepeat, insertWordAfter, insertWordBefore, removeWord, moveWord,
+    moveWordToPrevLine, moveWordToNextLine,
     replaceAll, applyWordTexts, applyCorrections, splitWord,
     addSegmentBreak, removeSegmentBreak, setSegmentBreaks,
     getSegmentedWords, getDeleteRanges,
     markAppliedCuts,
+    getHistory, restoreFromHistory, deleteFromHistory,
     pushUndo, undo, onChange, notifyAll
   };
 })();
@@ -1260,8 +1366,14 @@ const TranscriptEditor = (() => {
       <div class="menu-item" data-action="insert-after">
         <span class="icon">+</span> Sonrasına kelime ekle
       </div>
+      <div class="menu-item" data-action="line-up">
+        <span class="icon">⬆</span> Üst satıra al
+      </div>
+      <div class="menu-item" data-action="line-down">
+        <span class="icon">⬇</span> Alt satıra al
+      </div>
       <div class="menu-item" data-action="segment-break">
-        <span class="icon">⏎</span> Burada segment böl
+        <span class="icon">⏎</span> Burada satır böl
       </div>
       <div class="divider"></div>
       <div class="menu-item danger" data-action="remove">
@@ -1313,6 +1425,12 @@ const TranscriptEditor = (() => {
         if (text && text.trim()) TranscriptStore.insertWordAfter(id, text.trim());
         break;
       }
+      case 'line-up':
+        if (!TranscriptStore.moveWordToPrevLine(id)) UIController.toast('Bu kelime zaten üst satırda (satır başı değil).', 'info');
+        break;
+      case 'line-down':
+        if (!TranscriptStore.moveWordToNextLine(id)) UIController.toast('Bu kelime zaten alt satırda (satır sonu değil).', 'info');
+        break;
       case 'segment-break':
         TranscriptStore.addSegmentBreak(id);
         break;
@@ -1914,9 +2032,16 @@ const SubtitleEngine = (() => {
     bgBoxEnabled     : false,
     bgBoxColor       : '#000000',
     bgBoxOpacity     : 75,
+    bgBoxRadius      : 30,
+    bgBoxPadding     : 40,
     passiveColor     : '#AAAAAA',
     allCaps          : false
   };
+
+  // Aktif sekans çözünürlüğü (önizleme en-boy oranı + gerçek-ölçek font için)
+  let _seqW = 0, _seqH = 0;
+  // Son PNG-altyazı basımı (yeniden basınca replace + disk temizliği için)
+  let _lastBurnDir = '', _lastBurnMarker = '';
 
   function _loadFromStorage() {
     try {
@@ -1933,6 +2058,14 @@ const SubtitleEngine = (() => {
 
   function getStyle()        { return { ..._style }; }
   function setStyle(updates) { Object.assign(_style, updates); _saveToStorage(); _updatePreview(); }
+
+  /** Sekans çözünürlüğünü bildir → önizleme gerçek en-boy oranına ve font ölçeğine geçer. */
+  function setFrameInfo(w, h) {
+    _seqW = parseInt(w, 10) || 0;
+    _seqH = parseInt(h, 10) || 0;
+    _updatePreview();
+  }
+  function getSeqSize() { return { w: _seqW, h: _seqH }; }
 
   function _getAlignmentTag(align, x, y) {
     let tag = 2; // Bottom-Center
@@ -1955,8 +2088,17 @@ const SubtitleEngine = (() => {
   function _updatePreview() {
     const preview = document.getElementById('subtitlePreviewText');
     if (!preview) return;
+
+    // Gerçek-ölçek font: sekans genişliği biliniyorsa önizleme kutusu / sekans oranı.
+    // Böylece paneldeki px değeri Premiere'deki görünümle birebir eşleşir (WYSIWYG).
+    const container = document.getElementById('subtitlePreviewContainer');
+    let scale = 0.35; // sekans bilinmiyorsa varsayılan
+    if (_seqW > 0 && container && container.clientWidth > 0) {
+      scale = container.clientWidth / _seqW;
+    }
+
     preview.style.fontFamily       = _style.fontFamily;
-    preview.style.fontSize         = Math.max(12, Math.round(_style.fontSize * 0.35)) + 'px';
+    preview.style.fontSize         = Math.max(8, Math.round(_style.fontSize * scale)) + 'px';
     preview.style.color            = _style.color;
     preview.style.webkitTextStroke = _style.strokeWidth + 'px ' + _style.strokeColor;
     preview.style.textShadow       = _style.shadowEnabled ? '2px 2px 4px rgba(0,0,0,.85)' : 'none';
@@ -1967,6 +2109,21 @@ const SubtitleEngine = (() => {
     preview.className = 'subtitle-preview-text';
     if (_style.alignment) {
       preview.classList.add('align-' + _style.alignment);
+    }
+
+    // Arka plan kutusu — önizlemede de göster (yuvarlaklık + dolgu ile WYSIWYG)
+    if (_style.bgBoxEnabled) {
+      const fp   = Math.max(8, Math.round(_style.fontSize * scale));
+      const padX = Math.max(2, Math.round(fp * ((_style.bgBoxPadding != null ? _style.bgBoxPadding : 40) / 100)));
+      const padY = Math.max(1, Math.round(padX * 0.55));
+      const boxH = fp + padY * 2;
+      preview.style.background    = _hexToRgba(_style.bgBoxColor, (_style.bgBoxOpacity != null ? _style.bgBoxOpacity : 75) / 100);
+      preview.style.padding       = padY + 'px ' + padX + 'px';
+      preview.style.borderRadius  = Math.round(boxH / 2 * ((_style.bgBoxRadius != null ? _style.bgBoxRadius : 30) / 100)) + 'px';
+    } else {
+      preview.style.background   = 'none';
+      preview.style.padding      = '6px 10px';
+      preview.style.borderRadius = '0';
     }
 
     // Vurgu ve bounce önizlemeye yansır
@@ -2045,14 +2202,16 @@ const SubtitleEngine = (() => {
   }
 
   /**
-   * Altyazıları Premiere timeline'ına native caption track olarak ekler.
-   * SRT üretir → projeye aktarır → caption track'e yerleştirir (best-effort).
+   * Animasyonlu altyazıları (MOGRT) timeline'a ekler.
+   * İKİ FAZLI: (1) tüm MOGRT klipleri içe aktarılır, (2) Premiere onları
+   * yüklesin diye beklenir, sonra metinler doldurulur (getMGTComponent ancak
+   * yükleme bitince component döndürür). Metin gelene dek retry edilir.
+   * @param {Function} onPhase (msg) — ilerleme bildirimi
    */
-  async function injectToTimeline() {
+  async function injectToTimeline(onPhase) {
     const segmented = TranscriptStore.getSegmentedWords();
     if (segmented.length === 0) throw new Error('Transkript boş. Önce transkript oluşturun.');
 
-    // Animasyonlu altyazı (MOGRT) → satır bazlı metin segmentleri
     const segments = _buildCaptionSegments(segmented);
 
     // Eklenti yolunu CLIENT tarafından güvenilir biçimde al ($.fileName JSX'te güvenilmez)
@@ -2067,18 +2226,45 @@ const SubtitleEngine = (() => {
 
     const options = { allCaps: _style.allCaps, mogrtPath };
 
-    return new Promise((resolve, reject) => {
-      const cs = window.getCSInterface ? window.getCSInterface() : null;
-      const script = `createCaptionGraphicsFromMogrt(${JSON.stringify(JSON.stringify(segments))}, ${JSON.stringify(JSON.stringify(options))})`;
-      if (cs) {
-        cs.evalScript(script, result => {
-          try { resolve(JSON.parse(result)); }
-          catch (e) { reject(new Error('ExtendScript yanıtı işlenemedi: ' + e.message)); }
-        });
-      } else {
-        reject(new Error('Premiere Pro bağlantısı yok.'));
-      }
+    const cs = (window.getCSInterface && typeof window.__adobe_cep__ !== 'undefined')
+      ? window.getCSInterface() : null;
+    if (!cs) throw new Error('Premiere Pro bağlantısı yok.');
+
+    const evalP = (script) => new Promise((resolve, reject) => {
+      cs.evalScript(script, result => {
+        try { resolve(JSON.parse(result)); }
+        catch (e) { reject(new Error('ExtendScript yanıtı işlenemedi: ' + e.message)); }
+      });
     });
+    const segJSON = JSON.stringify(JSON.stringify(segments));
+
+    // ── FAZ 1: tüm MOGRT kliplerini içe aktar ──
+    onPhase && onPhase('MOGRT klipleri yerleştiriliyor…');
+    const importRes = await evalP(
+      `createCaptionGraphicsFromMogrt(${segJSON}, ${JSON.stringify(JSON.stringify(options))})`);
+    if (!importRes.success) return importRes;
+
+    // ── FAZ 2: yükleme bitsin diye bekle + metni doldur (retry) ──
+    let fillRes = { textMethod: 'none', filledCount: 0, total: segments.length, paramDiag: '' };
+    const MAX_TRIES = 4;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+      onPhase && onPhase(`Metinler dolduruluyor… (deneme ${attempt}/${MAX_TRIES})`);
+      await new Promise(r => setTimeout(r, attempt === 1 ? 1600 : 1400));
+      fillRes = await evalP(
+        `fillMogrtTextsByTime(${segJSON}, '${importRes.trackIndex}')`);
+      if (fillRes.success && fillRes.textMethod && fillRes.textMethod !== 'none') break;
+    }
+
+    return {
+      success     : true,
+      createdCount: importRes.createdCount,
+      total       : importRes.total,
+      trackIndex  : importRes.trackIndex,
+      textMethod  : fillRes.textMethod || 'none',
+      filledCount : fillRes.filledCount || 0,
+      paramDiag   : fillRes.paramDiag || '',
+      note        : fillRes.note || importRes.note || ''
+    };
   }
 
   /**
@@ -2175,7 +2361,333 @@ const SubtitleEngine = (() => {
     return breakIds.length;
   }
 
-  return { getStyle, setStyle, generateSubtitles, injectToTimeline, autoSegmentSubtitles };
+  /* ══ GÜVENİLİR Altyazı: canvas → PNG → timeline (MOGRT'a gerek yok) ══ */
+
+  function _hexToRgba(hex, alpha) {
+    hex = String(hex || '#000000').replace('#', '');
+    const r = parseInt(hex.substring(0, 2), 16) || 0;
+    const g = parseInt(hex.substring(2, 4), 16) || 0;
+    const b = parseInt(hex.substring(4, 6), 16) || 0;
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
+
+  function _roundRect(ctx, x, y, w, h, r) {
+    if (w < 2 * r) r = w / 2;
+    if (h < 2 * r) r = h / 2;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function _wrapLines(ctx, text, maxWidth) {
+    const words = String(text).split(/\s+/).filter(Boolean);
+    const lines = [];
+    let cur = '';
+    for (const w of words) {
+      const test = cur ? cur + ' ' + w : w;
+      if (ctx.measureText(test).width > maxWidth && cur) { lines.push(cur); cur = w; }
+      else cur = test;
+    }
+    if (cur) lines.push(cur);
+    return lines.length ? lines : [''];
+  }
+
+  async function _ensureFontLoaded(family, px) {
+    try {
+      if (document.fonts && document.fonts.load) {
+        await document.fonts.load(`800 ${px}px "${family}"`);
+        await document.fonts.ready;
+      }
+    } catch (e) {}
+  }
+
+  /**
+   * Tek bir altyazıyı sekans çözünürlüğünde saydam canvas'a çizer.
+   * @param {string|Array} content  düz metin VEYA [{word, active}] (karaoke vurgu)
+   */
+  function _renderCaptionToCanvas(content, st, W, H) {
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+    const fontPx = Math.max(8, st.fontSize | 0);
+    const isKaraoke = Array.isArray(content);
+
+    ctx.font = `800 ${fontPx}px "${st.fontFamily}", Arial, sans-serif`;
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';   // her zaman manuel konumlandırma (kelime kelime)
+
+    // 1) İçeriği kelime dizisine çevir (statik = tek renk; karaoke = aktif vurgulu)
+    let words;
+    if (isKaraoke) {
+      words = content.map(w => ({ word: st.allCaps ? String(w.word).toUpperCase() : String(w.word), active: !!w.active }));
+    } else {
+      const plain = st.allCaps ? String(content).toUpperCase() : String(content);
+      words = plain.split(/\s+/).filter(Boolean).map(w => ({ word: w, active: false }));
+    }
+    if (!words.length) words = [{ word: '', active: false }];
+    const spaceW = Math.max(ctx.measureText(' ').width, fontPx * 0.22);
+    words.forEach(w => { w.w = ctx.measureText(w.word).width; });
+
+    // 2) Kelimeleri satırlara SARMALA (kareyi taşırmaz)
+    const maxW = W * 0.9;
+    const lines = [];
+    let cur = [], curW = 0;
+    words.forEach(w => {
+      const add = (cur.length ? spaceW : 0) + w.w;
+      if (cur.length && (curW + add) > maxW) { lines.push({ words: cur, width: curW }); cur = []; curW = 0; }
+      curW += (cur.length ? spaceW : 0) + w.w;
+      cur.push(w);
+    });
+    if (cur.length) lines.push({ words: cur, width: curW });
+
+    // 3) Dikey yerleşim (positionY = blok merkezi)
+    const lineH = Math.round(fontPx * 1.32);
+    const totalH = lines.length * lineH;
+    const cx = Math.round(W * (st.positionX / 100));
+    const cyCenter = Math.round(H * (st.positionY / 100));
+    const firstBaseline = Math.round(cyCenter - totalH / 2 + fontPx * 0.8);
+    const align = st.alignment === 'left' ? 'left' : st.alignment === 'right' ? 'right' : 'center';
+    const lineX = (ln) => align === 'left' ? cx : align === 'right' ? cx - ln.width : cx - ln.width / 2;
+
+    // 4) Arka plan kutusu — satır başına, AYARLANABİLİR yuvarlaklık + dolgu
+    if (st.bgBoxEnabled) {
+      const padX = Math.round(fontPx * ((st.bgBoxPadding != null ? st.bgBoxPadding : 40) / 100));
+      const padY = Math.round(padX * 0.55);
+      const radPct = (st.bgBoxRadius != null ? st.bgBoxRadius : 30) / 100;   // 0=köşeli, 1=hap
+      ctx.fillStyle = _hexToRgba(st.bgBoxColor, (st.bgBoxOpacity != null ? st.bgBoxOpacity : 75) / 100);
+      lines.forEach((ln, i) => {
+        const bx = lineX(ln);
+        const topY = firstBaseline + i * lineH - fontPx;
+        const boxW = ln.width + padX * 2, boxH = fontPx + padY * 2;
+        const r = Math.round(Math.min(boxW, boxH) / 2 * radPct);
+        _roundRect(ctx, Math.round(bx - padX), Math.round(topY - padY), Math.round(boxW), Math.round(boxH), r);
+        ctx.fill();
+      });
+    }
+
+    const drawStyledText = (text, x, y, fill) => {
+      if (st.shadowEnabled) {
+        ctx.shadowColor = 'rgba(0,0,0,0.85)';
+        ctx.shadowBlur = Math.round(fontPx * 0.10);
+        ctx.shadowOffsetX = Math.round(fontPx * 0.04);
+        ctx.shadowOffsetY = Math.round(fontPx * 0.05);
+      }
+      if (st.strokeWidth > 0) {
+        ctx.lineWidth = st.strokeWidth * 2;
+        ctx.strokeStyle = st.strokeColor;
+        ctx.lineJoin = 'round'; ctx.miterLimit = 2;
+        ctx.strokeText(text, x, y);
+      }
+      ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
+      ctx.fillStyle = fill;
+      ctx.fillText(text, x, y);
+    };
+
+    // 5) Metni satır + kelime olarak çiz (karaoke'de aktif kelime vurgulu)
+    lines.forEach((ln, i) => {
+      const y = firstBaseline + i * lineH;
+      let penX = lineX(ln);
+      ln.words.forEach(w => {
+        const fill = w.active ? (st.highlightEnabled ? st.highlightColor : st.color)
+                              : (isKaraoke ? (st.passiveColor || st.color) : st.color);
+        drawStyledText(w.word, penX, y, fill);
+        penX += w.w + spaceW;
+      });
+    });
+
+    return canvas;
+  }
+
+  /**
+   * Altyazıları PNG olarak çizip Premiere timeline'a basar.
+   * @param {Function} onPhase (msg)
+   * @param {boolean}  karaoke  true → kelime başına PNG (vurgu animasyonu)
+   */
+  async function burnInCaptions(onPhase, karaoke) {
+    const segmentedWords = TranscriptStore.getSegmentedWords();
+    if (!segmentedWords.length) throw new Error('Transkript boş. Önce transkript oluşturun.');
+
+    const cs = (window.getCSInterface && typeof window.__adobe_cep__ !== 'undefined')
+      ? window.getCSInterface() : null;
+    if (!cs) throw new Error('Premiere Pro bağlantısı yok.');
+    if (typeof require !== 'function') throw new Error('Node.js entegrasyonu yok.');
+
+    // Sekans çözünürlüğü
+    let W = _seqW, H = _seqH;
+    if (!W || !H) {
+      const r = await new Promise(res =>
+        cs.evalScript('getSequenceSettings()', x => { try { res(JSON.parse(x)); } catch (e) { res(null); } }));
+      if (r && r.success) { W = r.width; H = r.height; _seqW = W; _seqH = H; }
+      else { W = 1920; H = 1080; }
+    }
+
+    await _ensureFontLoaded(_style.fontFamily, _style.fontSize);
+
+    const fs    = require('fs');
+    const os    = require('os');
+    const path  = require('path');
+    const stamp = Date.now();
+    const dir   = path.join(os.tmpdir(), 'rastflow_caps_' + stamp);
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+
+    // REPLACE: önceki basımı timeline'dan kaldır + dosyalarını sil (disk birikmesin)
+    if (_lastBurnMarker) {
+      onPhase && onPhase('Önceki altyazılar kaldırılıyor…');
+      try { await new Promise(res => cs.evalScript(`removeCaptionClipsByMarker(${JSON.stringify(_lastBurnMarker)})`, () => res())); } catch (e) {}
+      try { fs.rmSync(_lastBurnDir, { recursive: true, force: true }); } catch (e) {}
+      _lastBurnMarker = ''; _lastBurnDir = '';
+    }
+
+    // Render hedefleri oluştur
+    const renders = [];   // {content, start, end}
+    if (karaoke) {
+      // Her caption satırı için, her kelimenin aktif olduğu ayrı kare
+      segmentedWords.forEach(group => {
+        const lineSegs = _splitGroupToLines(group);
+        lineSegs.forEach(lineWords => {
+          for (let k = 0; k < lineWords.length; k++) {
+            renders.push({
+              content: lineWords.map((w, idx) => ({ word: w.word, active: idx === k })),
+              start: lineWords[k].start,
+              end:   (k < lineWords.length - 1) ? lineWords[k + 1].start : lineWords[k].end
+            });
+          }
+        });
+      });
+    } else {
+      _buildCaptionSegments(segmentedWords).forEach(s =>
+        renders.push({ content: s.text, start: s.start, end: s.end }));
+    }
+    if (!renders.length) throw new Error('Altyazı segmenti yok.');
+
+    onPhase && onPhase(`${renders.length} altyazı görüntüsü çiziliyor…`);
+
+    // Tek kareyi çiz → async PNG kodla (toBlob, UI'yi bloklamaz) → diske yaz
+    const writeOne = (i) => new Promise((resolve, reject) => {
+      let canvas;
+      try { canvas = _renderCaptionToCanvas(renders[i].content, _style, W, H); }
+      catch (e) { reject(e); return; }
+      canvas.toBlob(blob => {
+        if (!blob) { reject(new Error('PNG kodlanamadı')); return; }
+        blob.arrayBuffer().then(ab => {
+          // Benzersiz ad (stamp) → eski run'ların aynı adlı öğeleriyle karışmaz
+          const file = path.join(dir, 'cap_' + stamp + '_' + String(i).padStart(4, '0') + '.png');
+          fs.promises.writeFile(file, Buffer.from(ab))
+            .then(() => resolve({ path: file.replace(/\\/g, '/'), start: renders[i].start, end: renders[i].end }))
+            .catch(reject);
+        }).catch(reject);
+      }, 'image/png');
+    });
+
+    // Sınırlı eşzamanlılık (6) → hız + makul bellek
+    const items = new Array(renders.length);
+    const CONC = 6;
+    let finished = 0;
+    for (let base = 0; base < renders.length; base += CONC) {
+      const batch = [];
+      for (let k = base; k < Math.min(base + CONC, renders.length); k++) {
+        batch.push(writeOne(k).then(it => { items[k] = it; finished++; }));
+      }
+      await Promise.all(batch);
+      onPhase && onPhase(`Görüntü ${Math.min(finished, renders.length)}/${renders.length}…`);
+    }
+
+    // FAZ 1: PNG'leri içe aktar (ASENKRON ingest)
+    onPhase && onPhase('Görüntüler içe aktarılıyor…');
+    const paths = items.map(it => it.path);
+    const impRes = await new Promise((resolve, reject) =>
+      cs.evalScript(`importFilesForPlacement(${JSON.stringify(JSON.stringify(paths))})`, r => {
+        try { resolve(JSON.parse(r)); } catch (e) { reject(new Error('İçe aktarma yanıtı: ' + e.message)); }
+      }));
+    if (!impRes.success) throw new Error('İçe aktarma başarısız: ' + (impRes.error || '?'));
+
+    // Premiere ingest'i bitirsin diye event-loop'a zaman tanı
+    await new Promise(r => setTimeout(r, 1500));
+
+    // FAZ 2: zaman çizelgesine yerleştir
+    onPhase && onPhase('Görüntüler timeline\'a yerleştiriliyor…');
+    const payload = JSON.stringify({ items });
+    const placeRes = await new Promise((resolve, reject) => {
+      cs.evalScript(`placeImageCaptions(${JSON.stringify(payload)})`, r => {
+        try { resolve(JSON.parse(r)); }
+        catch (e) { reject(new Error('Yerleştirme yanıtı işlenemedi: ' + e.message)); }
+      });
+    });
+
+    // Başarılıysa bu basımı "önceki" olarak işaretle → bir sonraki basımda replace edilir
+    if (placeRes && placeRes.success && placeRes.placed > 0) {
+      _lastBurnDir = dir;
+      _lastBurnMarker = 'rastflow_caps_' + stamp;
+    }
+    return placeRes;
+  }
+
+  /** Bir kelime grubunu caption satırlarına böler (maks 8 kelime / 42 karakter). */
+  function _splitGroupToLines(group) {
+    const out = [];
+    let i = 0;
+    while (i < group.length) {
+      const slice = [];
+      let chars = 0;
+      while (i < group.length && slice.length < 8 && (chars + group[i].word.length + 1) <= 42) {
+        chars += group[i].word.length + 1; slice.push(group[i]); i++;
+      }
+      if (!slice.length) { slice.push(group[i]); i++; }
+      out.push(slice);
+    }
+    return out;
+  }
+
+  /**
+   * DÜZENLENEBİLİR altyazı: SRT üret → Premiere'de yerel caption track'e koy.
+   * Timeline'da çift tıkla metin düzenlenebilir; stil Premiere'in altyazı
+   * panelinden verilir (panel pixel-stili bunu sürmez).
+   */
+  async function createEditableCaptions(onPhase) {
+    const segmented = TranscriptStore.getSegmentedWords();
+    if (!segmented.length) throw new Error('Transkript boş. Önce transkript oluşturun.');
+
+    const cs = (window.getCSInterface && typeof window.__adobe_cep__ !== 'undefined')
+      ? window.getCSInterface() : null;
+    if (!cs) throw new Error('Premiere Pro bağlantısı yok.');
+
+    // Satır bazlı segmentler (caption: her satır kendi süresinde)
+    const segs = _buildCaptionSegments(segmented).map(s => ({ text: s.text, start: s.start, end: s.end }));
+    if (!segs.length) throw new Error('Altyazı segmenti yok.');
+
+    const evalP = (script) => new Promise((resolve, reject) =>
+      cs.evalScript(script, r => { try { resolve(JSON.parse(r)); } catch (e) { reject(new Error('yanıt: ' + e.message)); } }));
+
+    // FAZ 1: SRT yaz + projeye aktar (asenkron ingest)
+    onPhase && onPhase('SRT üretiliyor ve içe aktarılıyor…');
+    const prep = await evalP(`prepareCaptionSRT(${JSON.stringify(JSON.stringify(segs))})`);
+    if (!prep.success) return prep;
+
+    // Premiere ingest'i bitirsin diye bekle
+    await new Promise(r => setTimeout(r, 1500));
+
+    // FAZ 2: caption track olarak yerleştir
+    onPhase && onPhase('Caption track oluşturuluyor…');
+    const place = await evalP(
+      `placeCaptionTrackByName(${JSON.stringify(prep.baseName)}, ${JSON.stringify(prep.srtPath)})`);
+    return {
+      success: place.success !== false,
+      placedOnTimeline: !!place.placedOnTimeline,
+      method: place.method || '',
+      segmentCount: prep.segmentCount,
+      srtPath: prep.srtPath,
+      note: place.note || '',
+      error: place.error
+    };
+  }
+
+  return { getStyle, setStyle, setFrameInfo, getSeqSize, generateSubtitles,
+           injectToTimeline, burnInCaptions, createEditableCaptions, autoSegmentSubtitles,
+           _renderCaptionToCanvas };   // _render… tarayıcı testinde erişim için
 })();
 
 
@@ -2185,6 +2697,7 @@ const SubtitleEngine = (() => {
 const UIController = (() => {
   let _silenceDeleteList = [];
   let _fillerList = [...SilenceRemover.DEFAULT_FILLER];
+  let _previewAutoLoaded = false;
 
   function init() {
     // Tab sistemi
@@ -2194,8 +2707,28 @@ const UIController = (() => {
         document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById(tab.dataset.panel).classList.add('active');
+
+        // Altyazı sekmesi ilk açılışta önizleme karesini playhead'den otomatik yükle
+        if (tab.dataset.panel === 'panelSubtitle' && !_previewAutoLoaded) {
+          _previewAutoLoaded = true;
+          _refreshPreviewFrame();
+        }
       });
     });
+
+    // Günlüğü panoya kopyala (teşhis için tam metni almak kolaylaşır)
+    const logCopyBtn = document.getElementById('logCopyBtn');
+    if (logCopyBtn) logCopyBtn.addEventListener('click', () => {
+      const panel = document.getElementById('logPanel');
+      const txt = panel ? Array.from(panel.children).map(c => c.textContent).join('\n') : '';
+      copyText(txt);
+    });
+
+    // Transkript geçmişi (son 5)
+    const historyBtn = document.getElementById('historyBtn');
+    if (historyBtn) historyBtn.addEventListener('click', _toggleHistory);
+    const historyClose = document.getElementById('historyClose');
+    if (historyClose) historyClose.addEventListener('click', _closeHistory);
 
     // API Key
     const keyInput = document.getElementById('apiKeyInput');
@@ -2359,9 +2892,17 @@ const UIController = (() => {
     const genSubBtn = document.getElementById('generateSubtitlesBtn');
     if (genSubBtn) genSubBtn.addEventListener('click', _onGenerateSubtitles);
 
-    // Timeline enjeksiyon
+    // Altyazıyı timeline'a bas (PNG burn-in — güvenilir, MOGRT'a gerek yok)
     const injectBtn = document.getElementById('injectTimelineBtn');
-    if (injectBtn) injectBtn.addEventListener('click', _onInjectTimeline);
+    if (injectBtn) injectBtn.addEventListener('click', _onBurnCaptions);
+
+    // Düzenlenebilir altyazı (yerel caption track)
+    const editCapBtn = document.getElementById('editableCaptionsBtn');
+    if (editCapBtn) editCapBtn.addEventListener('click', _onEditableCaptions);
+
+    // Önizleme karesini playhead'den (yeniden) yükle
+    const loadFrameBtn = document.getElementById('loadFrameBtn');
+    if (loadFrameBtn) loadFrameBtn.addEventListener('click', _refreshPreviewFrame);
 
     // AI Editor
     AIEditorEngine.initUI();
@@ -2406,7 +2947,8 @@ const UIController = (() => {
       const cs = window.getCSInterface ? window.getCSInterface() : null;
       if (cs) {
         log('Yerel fontlar taranıyor…', 'info');
-        cs.evalScript('getAvailableFonts()', (result) => {
+        const _fontExtRoot = cs.getSystemPath(window.SystemPath ? window.SystemPath.EXTENSION : 'extension') || '';
+        cs.evalScript('getAvailableFonts(' + JSON.stringify(_fontExtRoot) + ')', (result) => {
           try {
             const res = JSON.parse(result);
             if (res && res.success && res.fonts && res.fonts.length > 0) {
@@ -2447,12 +2989,14 @@ const UIController = (() => {
     fonts.forEach(f => {
       const urlPath = 'file:///' + f.file.replace(/\\/g, '/');
       const format = f.file.toLowerCase().endsWith('.otf') ? 'opentype' : 'truetype';
+      // Ağırlık aralığı 100–900 + style normal: canvas hangi ağırlığı isterse istesin
+      // bu yüz (face) eşleşir; gerçek görünüm zaten dosyanın kendisinden gelir.
       css += `
         @font-face {
           font-family: '${f.name}';
           src: url('${urlPath}') format('${format}');
-          font-weight: ${f.weight === 'Regular' ? 'normal' : f.weight};
-          font-style: ${f.style};
+          font-weight: 100 900;
+          font-style: normal;
         }
       `;
     });
@@ -2520,6 +3064,102 @@ const UIController = (() => {
     document.addEventListener('mouseup', () => {
       isDragging = false;
     });
+  }
+
+  /* ── Önizleme: playhead'den gerçek video karesi + sekans en-boy oranı ── */
+  let _frameBusy = false;
+
+  function _refreshPreviewFrame() {
+    // CEP yoksa (tarayıcı geliştirme) cs.evalScript hata fırlatır → __adobe_cep__ ile guard
+    const cs = (window.getCSInterface && typeof window.__adobe_cep__ !== 'undefined')
+      ? window.getCSInterface() : null;
+    const container = document.getElementById('subtitlePreviewContainer');
+    if (!container) return;
+    if (!cs) { toast('Önizleme karesi yalnızca Premiere içinde yüklenir.', 'info'); return; }
+    if (_frameBusy) return;
+    _frameBusy = true;
+
+    cs.evalScript('getFrameSourceAtPlayhead()', (res) => {
+      let d;
+      try { d = JSON.parse(res); } catch (e) { d = { success: false, error: 'yanıt çözümlenemedi' }; }
+
+      if (!d.success) {
+        // Kare alınamasa bile en azından en-boy oranını sekanstan uygula
+        cs.evalScript('getSequenceSettings()', (r2) => {
+          try { const s = JSON.parse(r2); if (s.success) _applyPreviewSize(s.width, s.height); } catch (e) {}
+          _frameBusy = false;
+        });
+        log('Önizleme karesi alınamadı: ' + d.error, 'warn');
+        toast('Kare alınamadı: ' + d.error, 'warn');
+        return;
+      }
+
+      _applyPreviewSize(d.width, d.height);
+      _extractAndShowFrame(d.path, d.srcTime);
+    });
+  }
+
+  /** Önizleme kutusunu sekans en-boy oranına göre boyutlandır (9:16 vb.). */
+  function _applyPreviewSize(w, h) {
+    const container = document.getElementById('subtitlePreviewContainer');
+    if (!container || !w || !h) return;
+    const parentW = (container.parentElement && container.parentElement.clientWidth) || 300;
+    const maxH = 380;
+    let pw = parentW, ph = parentW * h / w;
+    if (ph > maxH) { ph = maxH; pw = maxH * w / h; }
+    container.style.width     = Math.round(pw) + 'px';
+    container.style.height    = Math.round(ph) + 'px';
+    container.style.minHeight = '0';
+    container.style.margin    = '0 auto';
+    SubtitleEngine.setFrameInfo(w, h);  // gerçek-ölçek font + WYSIWYG
+  }
+
+  /**
+   * Kaynak videodan kareyi göster — FFmpeg YOK. CEP Chromium'unun kendi <video>
+   * motoruyla file:// medyayı çözüp istenen saniyeye seek eder, kareyi önizleme
+   * kutusuna (object-fit: cover) yerleştirir. MP4/H.264 çözülür; MOV/ProRes
+   * çözülemezse en-boy oranı uygulanmış olarak nazikçe atlanır.
+   */
+  function _extractAndShowFrame(mediaPath, srcTime) {
+    const container = document.getElementById('subtitlePreviewContainer');
+    if (!container) { _frameBusy = false; return; }
+
+    // Önceki kareyi temizle
+    const old = container.querySelector('video.preview-frame');
+    if (old) old.remove();
+
+    const url   = 'file:///' + String(mediaPath).replace(/\\/g, '/');
+    const video = document.createElement('video');
+    video.className = 'preview-frame';
+    video.muted = true;
+    video.preload = 'auto';
+    video.setAttribute('playsinline', '');
+
+    let done = false;
+    const finish = (ok, msg) => {
+      if (done) return; done = true; _frameBusy = false;
+      if (ok) {
+        container.classList.add('has-frame');
+        log('Önizleme karesi yüklendi ✓', 'success');
+      } else {
+        log('Önizleme karesi alınamadı: ' + msg, 'warn');
+        toast('Kare gösterilemedi: ' + msg, 'warn');
+        video.remove();
+      }
+    };
+
+    video.addEventListener('error', () =>
+      finish(false, 'video çözülemedi (MOV/ProRes gibi formatlar desteklenmeyebilir)'));
+    video.addEventListener('loadeddata', () => {
+      try { video.currentTime = Math.max(0, srcTime || 0); }
+      catch (e) { finish(false, 'seek: ' + e.message); }
+    });
+    video.addEventListener('seeked', () => finish(true));
+    setTimeout(() => finish(false, 'zaman aşımı (8 sn)'), 8000);
+
+    log('Önizleme karesi yükleniyor…', 'info');
+    container.insertBefore(video, container.firstChild);  // metnin arkasında
+    video.src = url;
   }
 
   /* ── Transkript kapsam seçici (modal) ── */
@@ -2963,19 +3603,77 @@ const UIController = (() => {
     }
   }
 
+  async function _onBurnCaptions() {
+    const btn = document.getElementById('injectTimelineBtn');
+    if (btn) btn.disabled = true;
+    _showLoading(true);
+    try {
+      // Tarz "Dinamik" → karaoke (kelime başına vurgulu kare); "Kurumsal" → satır
+      const karaoke = (SubtitleEngine.getStyle().subtitleStyle === 'dynamic');
+      const result = await SubtitleEngine.burnInCaptions(
+        (msg) => { _setLoadingText(msg); log(msg, 'info'); }, karaoke);
+      if (result.success && result.placed > 0) {
+        toast(`${result.placed}/${result.total} altyazı V${result.trackIndex + 1}'e basıldı ✓`, 'success');
+        log(`Altyazı (görüntü): ${result.placed}/${result.total} klip · V${result.trackIndex + 1} · yerleştirme yöntemi m${result.method}` +
+            (result.note ? ' · ilk hata: ' + result.note : ''), 'success');
+      } else if (result.success) {
+        toast('Hiç altyazı yerleştirilemedi: ' + (result.note || 'bilinmeyen'), 'warn');
+        log('Altyazı 0 yerleşti. Not: ' + (result.note || '—'), 'warn');
+      } else {
+        toast('Altyazı hatası: ' + result.error, 'error');
+        log('Hata: ' + result.error, 'error');
+      }
+    } catch (e) {
+      toast('Hata: ' + e.message, 'error');
+      log('Hata: ' + e.message, 'error');
+    } finally {
+      if (btn) btn.disabled = false;
+      _showLoading(false);
+    }
+  }
+
+  async function _onEditableCaptions() {
+    const btn = document.getElementById('editableCaptionsBtn');
+    if (btn) btn.disabled = true;
+    _showLoading(true);
+    try {
+      const result = await SubtitleEngine.createEditableCaptions(
+        (msg) => { _setLoadingText(msg); log(msg, 'info'); });
+      if (result.success && result.placedOnTimeline) {
+        toast(`Düzenlenebilir altyazı caption track'e eklendi ✓ (${result.segmentCount} satır)`, 'success');
+        log(`Caption track: yerleşti · yöntem: ${result.method} · ${result.segmentCount} altyazı. Premiere'de çift tıkla düzenle.`, 'success');
+      } else if (result.success) {
+        toast('SRT üretildi ama otomatik yerleşmedi — Proje panelinden caption track\'e sürükleyin.', 'warn');
+        log('Caption yerleşmedi. ' + (result.note || '') + ' · SRT: ' + (result.srtPath || ''), 'warn');
+      } else {
+        toast('Altyazı hatası: ' + result.error, 'error');
+        log('Hata: ' + result.error, 'error');
+      }
+    } catch (e) {
+      toast('Hata: ' + e.message, 'error');
+      log('Hata: ' + e.message, 'error');
+    } finally {
+      if (btn) btn.disabled = false;
+      _showLoading(false);
+    }
+  }
+
   async function _onInjectTimeline() {
     const btn = document.getElementById('injectTimelineBtn');
     if (btn) btn.disabled = true;
     _showLoading(true);
     try {
-      const result = await SubtitleEngine.injectToTimeline();
+      const result = await SubtitleEngine.injectToTimeline(
+        (msg) => { _setLoadingText(msg); log(msg, 'info'); });
       if (result.success && result.createdCount > 0) {
-        toast(`${result.createdCount}/${result.total} animasyonlu altyazı V${result.trackIndex + 1}'e eklendi ✓`, 'success');
-        log(`MOGRT enjeksiyonu: ${result.createdCount}/${result.total} klip · metin yöntemi: ${result.textMethod}` +
-            (result.note ? ' · not: ' + result.note : ''), 'success');
+        const filled = result.filledCount || 0;
+        toast(`${result.createdCount}/${result.total} altyazı V${result.trackIndex + 1}'e eklendi · ${filled} metin dolduruldu ✓`,
+              filled > 0 ? 'success' : 'warn');
+        log(`MOGRT: ${result.createdCount}/${result.total} klip · metin doldurulan: ${filled} · yöntem: ${result.textMethod}` +
+            (result.note ? ' · not: ' + result.note : ''), filled > 0 ? 'success' : 'warn');
         if (result.textMethod === 'none') {
-          toast('Klipler kondu ama METİN doldurulamadı — şablon parametreleri Günlük\'e yazıldı.', 'warn');
-          log('MOGRT parametreleri: ' + (result.paramDiag || '(yok)'), 'warn');
+          toast('Klipler kondu ama METİN doldurulamadı — teşhis Günlük\'e yazıldı.', 'warn');
+          log('MOGRT teşhis: ' + (result.paramDiag || '(yok)'), 'warn');
         }
       } else if (result.success && result.createdCount === 0) {
         toast('Hiç klip oluşturulamadı: ' + (result.note || 'bilinmeyen'), 'warn');
@@ -3039,6 +3737,8 @@ const UIController = (() => {
       subtitleStyle : 'subtitleStyleSelect',
       bgBoxColor    : 'bgBoxColor',
       bgBoxOpacity  : 'bgOpacityInput',
+      bgBoxRadius   : 'bgRadiusInput',
+      bgBoxPadding  : 'bgPaddingInput',
       passiveColor  : 'passiveColorInput'
     };
 
@@ -3238,6 +3938,11 @@ const UIController = (() => {
     if (overlay) overlay.style.display = show ? 'flex' : 'none';
   }
 
+  function _setLoadingText(msg) {
+    const lt = document.getElementById('loadingText');
+    if (lt) lt.textContent = msg;
+  }
+
   function _setProgress(pct) {
     const fill = document.querySelector('.progress-fill');
     if (fill) {
@@ -3312,11 +4017,94 @@ const UIController = (() => {
     return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   }
 
+  /* ── Transkript Geçmişi paneli ── */
+  function _renderHistory() {
+    const list = document.getElementById('historyList');
+    if (!list) return;
+    list.innerHTML = '';
+    const items = TranscriptStore.getHistory();
+    if (!items.length) {
+      const e = document.createElement('div');
+      e.className = 'history-empty';
+      e.textContent = 'Henüz kayıtlı transkript yok. Bir transkript oluşturduğunda burada görünür.';
+      list.appendChild(e);
+      return;
+    }
+    items.forEach(it => {
+      const row  = document.createElement('div'); row.className = 'history-row';
+      const info = document.createElement('div'); info.className = 'history-info';
+      const prev = document.createElement('div'); prev.className = 'history-preview';
+      prev.textContent = (it.preview || '—') + (it.preview ? '…' : '');
+      const meta = document.createElement('div'); meta.className = 'history-meta';
+      meta.textContent = it.wordCount + ' kelime · ' + new Date(it.ts).toLocaleString('tr');
+      info.appendChild(prev); info.appendChild(meta);
+
+      const actions = document.createElement('div'); actions.className = 'history-actions';
+      const restore = document.createElement('button');
+      restore.className = 'btn btn-primary btn-sm';
+      restore.textContent = 'Geri Getir';
+      restore.addEventListener('click', () => {
+        if (TranscriptStore.restoreFromHistory(it.id)) {
+          toast('Transkript geri getirildi.', 'success');
+          log('Geçmişten geri getirildi: ' + it.wordCount + ' kelime.', 'info');
+          _closeHistory();
+          const tab = document.querySelector('.tab[data-panel="panelTranscript"]');
+          if (tab) tab.click();
+        } else {
+          toast('Geri getirilemedi.', 'error');
+        }
+      });
+      const del = document.createElement('button');
+      del.className = 'btn btn-secondary btn-sm';
+      del.textContent = '×'; del.title = 'Sil';
+      del.addEventListener('click', () => { TranscriptStore.deleteFromHistory(it.id); _renderHistory(); });
+      actions.appendChild(restore); actions.appendChild(del);
+
+      row.appendChild(info); row.appendChild(actions);
+      list.appendChild(row);
+    });
+  }
+  function _toggleHistory() {
+    const p = document.getElementById('historyPanel');
+    if (!p) return;
+    if (p.classList.contains('open')) { _closeHistory(); return; }
+    _renderHistory();
+    p.classList.add('open');
+  }
+  function _closeHistory() {
+    const p = document.getElementById('historyPanel');
+    if (p) p.classList.remove('open');
+  }
+
   return { init, updateStats, toggleSilenceQueue, isSilenceQueued, log, toast, copyText };
 })();
 
 /* ── DOM Hazır ── */
 document.addEventListener('DOMContentLoaded', () => {
+  // Tarayıcı sağ tık menüsünü devre dışı bırak (CEP panelinde gereksiz)
+  document.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Paneli yenile butonu — HTML/JS + ExtendScript host script'ini birlikte yeniler.
+  // (--mixed-context'te JSX motoru kalıcı olduğundan $.evalFile ile yeniden yükle.)
+  const reloadBtn = document.getElementById('reloadBtn');
+  if (reloadBtn) {
+    reloadBtn.addEventListener('click', () => {
+      try {
+        const cs = (window.getCSInterface && typeof window.__adobe_cep__ !== 'undefined')
+          ? window.getCSInterface() : null;
+        if (cs) {
+          const ext = cs.getSystemPath(window.SystemPath ? window.SystemPath.EXTENSION : 'extension');
+          if (ext) {
+            const jsx = (ext + '/host/index.jsx').replace(/\\/g, '/');
+            cs.evalScript('$.evalFile("' + jsx + '")', () => window.location.reload());
+            return;
+          }
+        }
+      } catch (e) {}
+      window.location.reload();
+    });
+  }
+
   UIController.init();
 
   // Inline event handlers moved here
@@ -3340,6 +4128,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const bgOp = document.getElementById('bgOpacityInput');
   if(bgOp) bgOp.addEventListener('input', function() { const el = document.getElementById('bgOpacityLabel'); if(el) el.textContent=this.value; });
+
+  // Arka plan kutusu: yuvarlaklık + dolgu etiketleri (başlangıç + canlı)
+  const _wireLabel = (inputId, labelId) => {
+    const inp = document.getElementById(inputId), lab = document.getElementById(labelId);
+    if (!inp || !lab) return;
+    lab.textContent = inp.value;
+    inp.addEventListener('input', function () { lab.textContent = this.value; });
+  };
+  _wireLabel('bgRadiusInput',  'bgRadiusLabel');
+  _wireLabel('bgPaddingInput', 'bgPaddingLabel');
 
   const refreshSeqBtn = document.getElementById('refreshSeqBtn');
   if(refreshSeqBtn) refreshSeqBtn.addEventListener('click', () => {

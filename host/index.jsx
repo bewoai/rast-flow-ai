@@ -410,6 +410,73 @@ function getSequenceInfo() {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+   3b. getSequenceSettings() — Çözünürlük (önizleme en-boy oranı için)
+   ══════════════════════════════════════════════════════════════════ */
+
+function getSequenceSettings() {
+  try {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans yok." });
+
+    var w = 0, h = 0;
+    try {
+      var st = seq.getSettings();
+      if (st) { w = parseInt(st.videoFrameWidth, 10) || 0; h = parseInt(st.videoFrameHeight, 10) || 0; }
+    } catch (e) {}
+    if (!w || !h) {
+      try { w = parseInt(seq.frameSizeHorizontal, 10) || w; h = parseInt(seq.frameSizeVertical, 10) || h; } catch (e2) {}
+    }
+    if (!w || !h) { w = 1920; h = 1080; }
+
+    return JSON.stringify({ success: true, width: w, height: h, name: seq.name });
+  } catch (e) {
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   3c. getFrameSourceAtPlayhead() — Playhead'deki video klibinin kaynak
+   medyası + kaynak zamanı (FFmpeg ile kare çıkarmak için).
+   ══════════════════════════════════════════════════════════════════ */
+
+function getFrameSourceAtPlayhead() {
+  try {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans yok." });
+
+    var ph = 0;
+    try { ph = _toSeconds(seq.getPlayerPosition()); } catch (e) {}
+
+    // En üstteki video kanalından başlayarak playhead'i kapsayan klibi bul
+    var found = null;
+    for (var t = seq.videoTracks.numTracks - 1; t >= 0 && !found; t--) {
+      var tr = seq.videoTracks[t];
+      for (var c = 0; c < tr.clips.numItems; c++) {
+        var cl = tr.clips[c];
+        var s = _toSeconds(cl.start), e = _toSeconds(cl.end);
+        if (ph >= s && ph < e && cl.projectItem) {
+          var path = "";
+          try { if (cl.projectItem.getMediaPath) path = cl.projectItem.getMediaPath(); } catch (e2) {}
+          if (path) {
+            var clipIn = _toSeconds(cl.inPoint);
+            found = { path: path, srcTime: clipIn + (ph - s) };
+            break;
+          }
+        }
+      }
+    }
+    if (!found) return JSON.stringify({ success: false, error: "Playhead konumunda okunabilir video klibi yok." });
+
+    var w = 1920, h = 1080;
+    try { var st = seq.getSettings(); if (st) { w = parseInt(st.videoFrameWidth, 10) || w; h = parseInt(st.videoFrameHeight, 10) || h; } } catch (e3) {}
+
+    return JSON.stringify({ success: true, path: found.path, srcTime: found.srcTime, playhead: ph, width: w, height: h });
+  } catch (e) {
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
    4. rippleDeleteRanges()
    ══════════════════════════════════════════════════════════════════ */
 
@@ -627,19 +694,23 @@ function createCaptionTrackFromSegments(segmentsJSON) {
       });
     }
 
-    // 3) Timeline'a caption track olarak yerleştir (best-effort, çoklu deneme)
+    // 3) Caption track olarak yerleştir — doğru API createCaptionTrack; çoklu imza dene
     app.userInputDisabled = true;
-    var placed = false;
+    var placed = false, method = "", firstErr = "";
     var tObj = new Time(); tObj.seconds = 0;
 
     var attempts = [
-      function () { seq.insertClip(captionItem, tObj, 0, 0); },
-      function () { seq.insertClip(captionItem, tObj); },
-      function () { seq.overwriteClip(captionItem, tObj); },
-      function () { seq.overwriteClip(captionItem, "0"); }
+      ["createCaptionTrack(ticks)",    function () { seq.createCaptionTrack(captionItem, tObj.ticks); }],
+      ["createCaptionTrack('0')",      function () { seq.createCaptionTrack(captionItem, "0"); }],
+      ["createCaptionTrack(0)",        function () { seq.createCaptionTrack(captionItem, 0); }],
+      ["createCaptionTrack(ticks,0)",  function () { seq.createCaptionTrack(captionItem, tObj.ticks, 0); }],
+      ["createCaptionTrack(ticks,1)",  function () { seq.createCaptionTrack(captionItem, tObj.ticks, 1); }],
+      ["insertClip(ticks,0,0)",        function () { seq.insertClip(captionItem, tObj.ticks, 0, 0); }],
+      ["overwriteClip(ticks,0,0)",     function () { seq.overwriteClip(captionItem, tObj.ticks, 0, 0); }]
     ];
     for (var ai = 0; ai < attempts.length && !placed; ai++) {
-      try { attempts[ai](); placed = true; } catch (eAtt) {}
+      try { attempts[ai][1](); placed = true; method = attempts[ai][0]; }
+      catch (eAtt) { if (!firstErr) firstErr = attempts[ai][0] + ":" + eAtt.message; }
     }
     app.userInputDisabled = false;
 
@@ -648,9 +719,64 @@ function createCaptionTrackFromSegments(segmentsJSON) {
       placedOnTimeline: placed,
       srtPath         : fsName,
       segmentCount    : segments.length,
-      note            : placed ? "" : "Otomatik yerleştirme bu Premiere sürümünde çalışmadı — SRT Proje panelinde, caption track'e sürükleyin."
+      method          : method,
+      note            : placed ? "" : ("Otomatik yerleşemedi (" + firstErr + ") — SRT Proje panelinde, caption track'e sürükleyin.")
     });
 
+  } catch (e) {
+    try { app.userInputDisabled = false; } catch (e2) {}
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/* ── İki fazlı caption (importFiles asenkron olduğundan): FAZ 1 yaz+aktar ── */
+function prepareCaptionSRT(segmentsJSON) {
+  try {
+    var segments = JSON.parse(segmentsJSON);
+    if (!segments || !segments.length) return JSON.stringify({ success: false, error: "Segment verisi boş." });
+    var written = _writeSRT(segments, "rastflow_captions_");
+    try { app.project.importFiles([written.fsName], true, app.project.rootItem, false); }
+    catch (eImp) { return JSON.stringify({ success: false, error: "SRT içe aktarılamadı: " + eImp.message, srtPath: written.fsName }); }
+    return JSON.stringify({ success: true, baseName: written.baseName, srtPath: written.fsName, segmentCount: segments.length });
+  } catch (e) {
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/* ── FAZ 2: aktarılan SRT öğesini bul + caption track olarak yerleştir ── */
+function placeCaptionTrackByName(baseName, srtPath) {
+  try {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans yok." });
+
+    var captionItem = _findImportedItem(baseName);
+    if (!captionItem) {
+      return JSON.stringify({ success: true, placedOnTimeline: false, srtPath: srtPath,
+        note: "İçe aktarılan SRT öğesi hâlâ bulunamadı — Proje panelinden caption track'e sürükleyin." });
+    }
+
+    app.userInputDisabled = true;
+    var placed = false, method = "", firstErr = "";
+    var tObj = new Time(); tObj.seconds = 0;
+    var attempts = [
+      ["createCaptionTrack(ticks)",   function () { seq.createCaptionTrack(captionItem, tObj.ticks); }],
+      ["createCaptionTrack('0')",     function () { seq.createCaptionTrack(captionItem, "0"); }],
+      ["createCaptionTrack(0)",       function () { seq.createCaptionTrack(captionItem, 0); }],
+      ["createCaptionTrack(ticks,0)", function () { seq.createCaptionTrack(captionItem, tObj.ticks, 0); }],
+      ["createCaptionTrack(ticks,1)", function () { seq.createCaptionTrack(captionItem, tObj.ticks, 1); }],
+      ["insertClip(ticks,0,0)",       function () { seq.insertClip(captionItem, tObj.ticks, 0, 0); }],
+      ["overwriteClip(ticks,0,0)",    function () { seq.overwriteClip(captionItem, tObj.ticks, 0, 0); }]
+    ];
+    for (var ai = 0; ai < attempts.length && !placed; ai++) {
+      try { attempts[ai][1](); placed = true; method = attempts[ai][0]; }
+      catch (eAtt) { if (!firstErr) firstErr = attempts[ai][0] + ":" + eAtt.message; }
+    }
+    app.userInputDisabled = false;
+
+    return JSON.stringify({
+      success: true, placedOnTimeline: placed, method: method, srtPath: srtPath,
+      note: placed ? "" : ("Otomatik yerleşemedi (" + firstErr + ") — Proje panelinden caption track'e sürükleyin.")
+    });
   } catch (e) {
     try { app.userInputDisabled = false; } catch (e2) {}
     return JSON.stringify({ success: false, error: e.message });
@@ -708,6 +834,166 @@ function _findImportedItem(baseName) {
   return null;
 }
 
+/**
+ * Önceki PNG-altyazı basımını timeline'dan kaldırır (kaynağı 'marker' içeren klipler).
+ * Re-burn = replace: eski altyazılar kalkar, diskteki dosyaları da client siler.
+ */
+function removeCaptionClipsByMarker(marker) {
+  try {
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans yok." });
+    if (!marker) return JSON.stringify({ success: true, removed: 0 });
+
+    // 1) Standart DOM: kaynağı marker içeren klipleri (track, start) topla
+    var targets = [];
+    for (var t = 0; t < seq.videoTracks.numTracks; t++) {
+      var tr = seq.videoTracks[t];
+      for (var c = 0; c < tr.clips.numItems; c++) {
+        var cl = tr.clips[c];
+        var mp = "";
+        try { if (cl.projectItem && cl.projectItem.getMediaPath) mp = String(cl.projectItem.getMediaPath() || ""); } catch (e) {}
+        if (mp.replace(/\\/g, "/").indexOf(marker) >= 0) targets.push({ t: t, s: _toSeconds(cl.start) });
+      }
+    }
+    if (!targets.length) return JSON.stringify({ success: true, removed: 0 });
+
+    // 2) QE ile timeline'dan kaldır (ripple yok → diğer klipler kaymaz; boşluk kalır, yenisi dolar)
+    if (typeof qe === "undefined") { try { app.enableQE(); } catch (e) {} }
+    var removed = 0;
+    if (typeof qe !== "undefined") {
+      app.userInputDisabled = true;
+      var qeSeq = qe.project.getActiveSequence();
+      for (var i = 0; i < targets.length; i++) {
+        try {
+          var qtr = qeSeq.getVideoTrackAt(targets[i].t);
+          for (var j = qtr.numItems - 1; j >= 0; j--) {
+            var it = qtr.getItemAt(j);
+            var s = _qeSecs(it.start);
+            if (s !== null && Math.abs(s - targets[i].s) < 0.05) { it.remove(false, false); removed++; break; }
+          }
+        } catch (eR) {}
+      }
+      app.userInputDisabled = false;
+    }
+    return JSON.stringify({ success: true, removed: removed, found: targets.length });
+  } catch (e) {
+    try { app.userInputDisabled = false; } catch (e2) {}
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/**
+ * Dosyaları projeye içe aktarır (PNG/SRT). importFiles ASENKRON ingest yaptığından,
+ * yerleştirme AYRI bir çağrıda (client gecikmesiyle) yapılmalı.
+ */
+function importFilesForPlacement(pathsJSON) {
+  try {
+    var paths = JSON.parse(pathsJSON);
+    if (!paths || !paths.length) return JSON.stringify({ success: false, error: "Yol listesi boş." });
+    app.project.importFiles(paths, true, app.project.rootItem, false);
+    return JSON.stringify({ success: true, count: paths.length });
+  } catch (e) {
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   5d. placeImageCaptions() — GÜVENİLİR Altyazı (PNG burn-in)
+   Client canvas'ta çizip yazdığı PNG'leri timeline'a klip olarak koyar.
+   MOGRT/component API YOK → çalışması garanti (yalnız importFiles + overwriteClip).
+   ══════════════════════════════════════════════════════════════════ */
+
+function placeImageCaptions(payloadJSON) {
+  try {
+    app.userInputDisabled = true;
+    var payload = JSON.parse(payloadJSON);
+    var items   = payload.items || [];
+    if (!items.length) { app.userInputDisabled = false; return JSON.stringify({ success: false, error: "Görüntü listesi boş." }); }
+
+    var seq = app.project.activeSequence;
+    if (!seq) { app.userInputDisabled = false; return JSON.stringify({ success: false, error: "Aktif sekans yok." }); }
+
+    // Hedef video kanalı: belirtilen ya da en üst
+    var trackIndex = (payload.trackIndex !== undefined && payload.trackIndex >= 0)
+      ? payload.trackIndex : (seq.videoTracks.numTracks - 1);
+    var track = seq.videoTracks[trackIndex];
+    if (!track) { app.userInputDisabled = false; return JSON.stringify({ success: false, error: "Video track yok: " + trackIndex }); }
+
+    // NOT: PNG'ler AYRI çağrıda (importFilesForPlacement) önceden içe aktarıldı —
+    // importFiles asenkron olduğundan aynı çağrıda arayınca "öğe bulunamadı" oluyordu.
+
+    // Her birini başlangıç zamanına yerleştir + süreyi ayarla.
+    //    overwriteClip imzası sürüme göre değişir → kademeli dene, tutan imzayı hatırla.
+    var placed = 0, firstErr = "", methodUsed = -1;
+    for (var j = 0; j < items.length; j++) {
+      var it   = items[j];
+      var item = _findItemByPathTail(it.path);
+      if (!item) { if (!firstErr) firstErr = "öğe bulunamadı: " + it.path; continue; }
+
+      var tSec = parseFloat(it.start);
+      var tObj = new Time(); tObj.seconds = tSec;
+
+      // Olası imzalar — track öncelikli (sekans imzası "Not Enough Parameters" verdi)
+      var tries = [
+        function () { track.overwriteClip(item, tObj); },
+        function () { track.overwriteClip(item, tSec); },
+        function () { track.overwriteClip(item, tObj.ticks); },
+        function () { track.insertClip(item, tObj); },
+        function () { track.insertClip(item, tSec); },
+        function () { track.insertClip(item, tObj.ticks); },
+        function () { seq.overwriteClip(item, tObj.ticks, trackIndex, 0); },
+        function () { seq.insertClip(item, tObj.ticks, trackIndex, 0); }
+      ];
+
+      var ok = false;
+      if (methodUsed >= 0) { try { tries[methodUsed](); ok = true; } catch (eKnown) {} }
+      if (!ok) {
+        for (var a = 0; a < tries.length; a++) {
+          try { tries[a](); methodUsed = a; ok = true; break; }
+          catch (eT) { if (!firstErr) firstErr = "m" + a + ":" + eT.message; }
+        }
+      }
+
+      if (ok) {
+        var clip = _findClipAtSec(track, tSec, 0.4);
+        if (clip) { try { var te = new Time(); te.seconds = parseFloat(it.end); clip.end = te; } catch (eD) {} }
+        placed++;
+      }
+    }
+
+    app.userInputDisabled = false;
+    return JSON.stringify({
+      success: true, placed: placed, total: items.length,
+      trackIndex: trackIndex, method: methodUsed, note: firstErr
+    });
+  } catch (e) {
+    try { app.userInputDisabled = false; } catch (e2) {}
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/** İçe aktarılan öğeyi dosya adı/yol kuyruğuna göre proje kökünde bul. */
+function _findItemByPathTail(p) {
+  var tail = String(p).replace(/\\/g, "/");
+  var slash = tail.lastIndexOf("/"); if (slash >= 0) tail = tail.substring(slash + 1);
+  var nameNoExt = tail.replace(/\.[^.]+$/, "");
+  try {
+    var root = app.project.rootItem;
+    for (var i = root.children.numItems - 1; i >= 0; i--) {
+      var it = root.children[i];
+      try {
+        var nm = String(it.name || "");
+        if (nm === tail || nm === nameNoExt || nm.indexOf(nameNoExt) >= 0) return it;
+        if (it.getMediaPath) {
+          var mp = String(it.getMediaPath() || "").replace(/\\/g, "/");
+          if (mp.indexOf(tail) >= 0) return it;
+        }
+      } catch (e) {}
+    }
+  } catch (e2) {}
+  return null;
+}
+
 /* ══════════════════════════════════════════════════════════════════
    5c. createCaptionGraphicsFromMogrt() — Animasyonlu Altyazı (MOGRT)
    Her segment için templates/caption.mogrt'ı timeline'a koyar, metnini
@@ -746,9 +1032,11 @@ function createCaptionGraphicsFromMogrt(segmentsJSON, optionsJSON) {
     var vCount     = seq.videoTracks.numTracks;
     var trackIndex = (opts.trackIndex !== undefined && opts.trackIndex < vCount) ? opts.trackIndex : (vCount - 1);
 
-    var created = 0, textMethod = "none", firstErr = "";
-    var firstClip = null;
+    var created = 0, firstErr = "";
 
+    // ── Tüm MOGRT kliplerini içe aktar. Metin doldurma AYRI bir çağrıda
+    //    (fillMogrtTextsByTime) yapılır — importMGT asenkron yükler; aynı
+    //    senkron çalıştırmada getMGTComponent henüz null döner. ──
     for (var i = 0; i < segments.length; i++) {
       var seg = segments[i];
       var s = parseFloat(seg.start), e = parseFloat(seg.end);
@@ -760,22 +1048,13 @@ function createCaptionGraphicsFromMogrt(segmentsJSON, optionsJSON) {
         try { clip = seq.importMGT(mogrtPath, t.ticks, trackIndex, 0); } catch (eImp) { if (!firstErr) firstErr = "importMGT: " + eImp.message; }
         if (!clip) clip = _findClipAtSec(seq.videoTracks[trackIndex], s);
         if (!clip) { if (!firstErr) firstErr = "importMGT klip döndürmedi"; continue; }
-        if (!firstClip) firstClip = clip;
 
         // Süreyi segmente ayarla
         try { var te = new Time(); te.seconds = e; clip.end = te; } catch (eDur) {}
 
-        // Metni doldur
-        var mm = _setMogrtText(clip, seg.text || "");
-        if (mm && textMethod === "none") textMethod = mm;
-
         created++;
       } catch (eSeg) { if (!firstErr) firstErr = eSeg.message; }
     }
-
-    // Metin doldurulamadıysa: şablonun parametre adlarını teşhis için döndür
-    var paramDiag = "";
-    if (textMethod === "none" && firstClip) paramDiag = _mogrtParamNames(firstClip);
 
     app.userInputDisabled = false;
     return JSON.stringify({
@@ -783,13 +1062,59 @@ function createCaptionGraphicsFromMogrt(segmentsJSON, optionsJSON) {
       createdCount: created,
       total       : segments.length,
       trackIndex  : trackIndex,
-      textMethod  : textMethod,
-      paramDiag   : paramDiag,
       note        : firstErr
     });
 
   } catch (e) {
     try { app.userInputDisabled = false; } catch (e2) {}
+    return JSON.stringify({ success: false, error: e.message });
+  }
+}
+
+/**
+ * MOGRT metinlerini zamanına göre doldur — createCaptionGraphicsFromMogrt'tan
+ * AYRI, gecikmeli çağrılır (client setTimeout + retry). O ana kadar MOGRT'lar
+ * yüklendiğinden getMGTComponent artık component döndürür.
+ */
+function fillMogrtTextsByTime(segmentsJSON, trackIndexStr) {
+  try {
+    var segments = JSON.parse(segmentsJSON);
+    var trackIndex = parseInt(trackIndexStr, 10);
+    if (isNaN(trackIndex)) trackIndex = 0;
+
+    var seq = app.project.activeSequence;
+    if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans yok." });
+    var track = seq.videoTracks[trackIndex];
+    if (!track) return JSON.stringify({ success: false, error: "Video track yok: " + trackIndex });
+
+    var filled = 0, textMethod = "none", firstClip = null, notReady = 0;
+
+    for (var i = 0; i < segments.length; i++) {
+      var s = parseFloat(segments[i].start);
+      if (isNaN(s)) continue;
+      var clip = _findClipAtSec(track, s, 0.25);   // gevşek tolerans (frame snap)
+      if (!clip) continue;
+      if (!firstClip) firstClip = clip;
+
+      // Component hazır mı? (henüz yüklenmediyse say → client retry eder)
+      if (!_getMgtComp(clip)) { notReady++; continue; }
+
+      var mm = _setMogrtText(clip, segments[i].text || "");
+      if (mm) { filled++; if (textMethod === "none") textMethod = mm; }
+    }
+
+    var paramDiag = "";
+    if (textMethod === "none" && firstClip) paramDiag = _mogrtParamNames(firstClip);
+
+    return JSON.stringify({
+      success    : true,
+      filledCount: filled,
+      total      : segments.length,
+      notReady   : notReady,
+      textMethod : textMethod,
+      paramDiag  : paramDiag
+    });
+  } catch (e) {
     return JSON.stringify({ success: false, error: e.message });
   }
 }
@@ -812,9 +1137,9 @@ function _findMogrt() {
 }
 
 /** Bir track'te başlangıcı verilen saniyeye en yakın klibi bul (importMGT null dönerse). */
-function _findClipAtSec(track, sec) {
+function _findClipAtSec(track, sec, tol) {
   if (!track) return null;
-  var best = null, bestDiff = 0.06;
+  var best = null, bestDiff = (tol === undefined) ? 0.06 : tol;
   for (var c = 0; c < track.clips.numItems; c++) {
     var cl = track.clips[c];
     var d = Math.abs(_toSeconds(cl.start) - sec);
@@ -823,59 +1148,217 @@ function _findClipAtSec(track, sec) {
   return best;
 }
 
-/** MOGRT klibinin metin parametresini doldur — çoklu strateji + teşhis döndürür. */
-function _setMogrtText(clip, text) {
-  try {
-    var mgt = (clip.getMGTComponent) ? clip.getMGTComponent() : null;
-    if (mgt && mgt.properties) {
-      var props = mgt.properties;
-      var n = props.numItems;
+var _lastTextErr   = "";   // son setValue hata teşhisi
+var _lastGetType   = "";   // getValue() tip teşhisi
+var _lastGetSample = "";   // getValue() içerik örneği
 
-      // 1) Adı "text/metin/source/kaynak/title/altyazı" geçen parametre
-      for (var i = 0; i < n; i++) {
-        var p  = props[i];
-        var dn = String(p.displayName || "").toLowerCase();
-        if (dn.indexOf("text") >= 0 || dn.indexOf("metin") >= 0 || dn.indexOf("source") >= 0 ||
-            dn.indexOf("kaynak") >= 0 || dn.indexOf("title") >= 0 || dn.indexOf("altyaz") >= 0) {
-          if (_trySetProp(p, text)) return "param:" + p.displayName;
+/** Bir parametre adı metin-benzeri mi? */
+function _isTextParamName(dn) {
+  dn = String(dn || "").toLowerCase();
+  return dn.indexOf("text") >= 0 || dn.indexOf("metin") >= 0 || dn.indexOf("source") >= 0 ||
+         dn.indexOf("kaynak") >= 0 || dn.indexOf("title") >= 0 || dn.indexOf("altyaz") >= 0 ||
+         dn.indexOf("layer") >= 0 || dn.indexOf("caption") >= 0;
+}
+
+/**
+ * MGT/MOGRT bileşenini bul.
+ *  1) Resmi metotlar: getMGTComponent / getMOGRTComponent
+ *  2) Fallback: clip.components içinde metin parametresi taşıyan bileşen
+ *     (PPro 2023'te importMGT klipleri resmi metotları null döndürebiliyor).
+ */
+function _getMgtComp(clip) {
+  try { if (clip.getMGTComponent)   { var c1 = clip.getMGTComponent();   if (c1) return c1; } } catch (e1) {}
+  try { if (clip.getMOGRTComponent) { var c2 = clip.getMOGRTComponent(); if (c2) return c2; } } catch (e2) {}
+
+  // Fallback: bileşenleri tara, metin parametreli olanı döndür
+  try {
+    if (clip.components && clip.components.numItems) {
+      for (var i = 0; i < clip.components.numItems; i++) {
+        var comp = clip.components[i];
+        if (!comp || !comp.properties) continue;
+        var pn = 0;
+        try { pn = comp.properties.numItems; } catch (ePn) { continue; }
+        for (var j = 0; j < pn; j++) {
+          var dn = "";
+          try { dn = comp.properties[j].displayName; } catch (eDn) {}
+          if (_isTextParamName(dn)) return comp;
         }
       }
-      // 2) Metin gibi davranan ilk parametre (string kabul eden)
-      for (var j = 0; j < n; j++) {
-        if (_trySetProp(props[j], text)) return "first-string:" + (props[j].displayName || j);
-      }
     }
-  } catch (e) {}
+  } catch (e3) {}
   return null;
 }
 
-function _trySetProp(p, text) {
-  // Düz string
-  try { p.setValue(text, true); return true; } catch (e1) {}
-  // TextDocument benzeri nesne
+/** Teşhis: klibin tüm bileşenlerini + parametre adlarını dök (MGT bulunamazsa). */
+function _diagClip(clip) {
+  var out = [];
   try {
-    var v = p.getValue();
-    if (v && typeof v === "object") { v.text = text; p.setValue(v, true); return true; }
-  } catch (e2) {}
+    out.push("getMGT=" + (clip.getMGTComponent ? "var" : "yok"));
+    out.push("getMOGRT=" + (clip.getMOGRTComponent ? "var" : "yok"));
+    if (clip.getMGTComponent) {
+      try { out.push("MGT()=" + (clip.getMGTComponent() ? "obj" : "null")); }
+      catch (eM) { out.push("MGT()err:" + eM.message); }
+    }
+    if (clip.components) {
+      var cn = clip.components.numItems;
+      out.push(cn + "comp:");
+      for (var i = 0; i < cn && i < 12; i++) {
+        var nm = "?", pc = 0, pnames = [];
+        try { nm = String(clip.components[i].displayName); } catch (e1) {}
+        try {
+          pc = clip.components[i].properties.numItems;
+          for (var j = 0; j < pc && j < 6; j++) {
+            try { pnames.push(String(clip.components[i].properties[j].displayName)); } catch (eP) {}
+          }
+        } catch (e2) {}
+        out.push(i + ":'" + nm + "'(" + pc + "p:" + pnames.join(",") + ")");
+      }
+    } else { out.push("components yok"); }
+  } catch (e) { out.push("diag-err:" + e.message); }
+  return out.join(" ");
+}
+
+/** MOGRT klibinin metin parametresini doldur — ad eşleşen param, yoksa tüm paramları dene. */
+function _setMogrtText(clip, text) {
+  _lastTextErr = "";
+  var mgt = _getMgtComp(clip);
+  if (!mgt)            { _lastTextErr = "MGT bileşeni yok (getMGTComponent/getMOGRTComponent null)"; return null; }
+  if (!mgt.properties) { _lastTextErr = "properties yok"; return null; }
+
+  var props = mgt.properties, n = props.numItems;
+
+  // 1) Adı metin-benzeri parametre
+  for (var i = 0; i < n; i++) {
+    var dn = String(props[i].displayName || "").toLowerCase();
+    if (dn.indexOf("text") >= 0 || dn.indexOf("metin") >= 0 || dn.indexOf("source") >= 0 ||
+        dn.indexOf("kaynak") >= 0 || dn.indexOf("layer") >= 0 || dn.indexOf("title") >= 0 || dn.indexOf("altyaz") >= 0) {
+      if (_trySetProp(props[i], text)) return "param:" + (props[i].displayName || i);
+    }
+  }
+  // 2) Ad eşleşmediyse: tüm parametreleri sırayla dene (string kabul eden ilki yazar)
+  for (var j = 0; j < n; j++) {
+    if (_trySetProp(props[j], text)) return "any:" + (props[j].displayName || j);
+  }
+  if (!_lastTextErr) _lastTextErr = "hiçbir parametre metni kabul etmedi (" + n + ")";
+  return null;
+}
+
+/** Bir parametreye metni yazmaya çalış — Nesne / JSON-string / düz string. */
+function _trySetProp(p, text) {
+  var errs = [];
+  var got = null, gotType = "yok";
+  try { got = p.getValue(); gotType = (got === null) ? "null" : typeof got; }
+  catch (eG) { errs.push("getValue:" + eG.message); }
+
+  // Teşhis: getValue() ne döndürdü? (metin dolmazsa Günlük'e yazılır)
+  _lastGetType = gotType;
+  try {
+    if (gotType === "string")              _lastGetSample = String(got).substring(0, 280);
+    else if (got && gotType === "object")  _lastGetSample = "{" + _objKeys(got) + "}";
+    else                                   _lastGetSample = String(got);
+  } catch (eS) { _lastGetSample = "?"; }
+
+  // A) Nesne değeri (TextDocument / strDB / mText / derin arama)
+  if (got && typeof got === "object") {
+    var changed = false;
+    try { if (got.text  !== undefined) { got.text  = text; changed = true; } } catch (e1) {}
+    try { if (!changed && got.mText !== undefined) { got.mText = text; changed = true; } } catch (e2) {}
+    try { if (!changed && got.strDB && got.strDB.length) { got.strDB[0].str = text; changed = true; } } catch (e3) {}
+    if (!changed) changed = _replaceTextInObj(got, text);
+    if (changed && _setVal(p, got, errs)) return true;
+    if (!changed) errs.push("obj: metin alanı yok");
+  }
+
+  // B) JSON string (MOGRT source-text en yaygın biçimi: serileştirilmiş metin)
+  if (gotType === "string" && got.length > 1) {
+    var c0 = got.charAt(0);
+    if (c0 === "{" || c0 === "[") {
+      try {
+        var obj = JSON.parse(got);
+        if (_replaceTextInObj(obj, text)) {
+          if (_setVal(p, JSON.stringify(obj), errs)) return true;
+        } else { errs.push("json: metin alanı bulunamadı"); }
+      } catch (eJ) { errs.push("jsonParse:" + eJ.message); }
+    }
+  }
+
+  // C) Düz string (farklı imzalar)
+  if (_setVal(p, text, errs)) return true;
+
+  _lastTextErr = "getType=" + gotType + " | " + errs.join(" | ");
   return false;
 }
 
-/** Teşhis: MOGRT klibinin parametre adlarını listele (metin dolmazsa). */
+/** p.setValue'yu iki imzayla dene (updateUI bayraklı ve bayraksız). */
+function _setVal(p, val, errs) {
+  try { p.setValue(val, true); return true; } catch (e1) { errs.push("setVal(,true):" + e1.message); }
+  try { p.setValue(val);       return true; } catch (e2) { errs.push("setVal():" + e2.message); }
+  return false;
+}
+
+/** Nesnenin ilk ~20 anahtarını virgülle listele (teşhis). */
+function _objKeys(o) {
+  var ks = [];
+  try { for (var k in o) { if (o.hasOwnProperty(k)) { ks.push(k); if (ks.length >= 20) break; } } } catch (e) {}
+  return ks.join(",");
+}
+
+/**
+ * Bir nesne/dizi içinde metin taşıyan TEK alanı bulup değiştir (derin, puanlı).
+ * Ad sinyali (text/mText/str/caption/title) + uzunluk puanına göre en olası
+ * string yaprağı seçilir; böylece font/renk alanları yanlışlıkla ezilmez.
+ * @returns {boolean} değişiklik yapıldı mı
+ */
+function _replaceTextInObj(obj, newText) {
+  var best = null, bestKey = null, bestScore = -1;
+
+  function scoreKey(k, v) {
+    var lk = String(k).toLowerCase(), sc = 0;
+    if      (lk === "mtext" || lk === "text") sc = 100;
+    else if (lk.indexOf("mtext") >= 0)        sc = 90;
+    else if (lk === "str")                     sc = 80;
+    else if (lk.indexOf("text") >= 0)          sc = 70;
+    else if (lk.indexOf("caption") >= 0 || lk.indexOf("title") >= 0) sc = 60;
+    sc += Math.min(20, v.length / 4);  // uzun string → muhtemel placeholder metni
+    return sc;
+  }
+  function walk(node) {
+    if (!node || typeof node !== "object") return;
+    for (var k in node) {
+      if (!node.hasOwnProperty(k)) continue;
+      var v = node[k];
+      if (typeof v === "string" && v.length >= 1) {
+        var sc = scoreKey(k, v);
+        if (sc > bestScore) { bestScore = sc; best = node; bestKey = k; }
+      } else if (v && typeof v === "object") {
+        walk(v);
+      }
+    }
+  }
+  walk(obj);
+
+  if (best && bestKey !== null) {
+    try { best[bestKey] = newText; return true; } catch (e) {}
+  }
+  return false;
+}
+
+/** Teşhis: MOGRT parametre adları + son setValue hatası (metin dolmazsa). */
 function _mogrtParamNames(clip) {
   try {
-    if (!clip.getMGTComponent) return "getMGTComponent metodu yok (klip MGT değil)";
-    var mgt = clip.getMGTComponent();
-    if (!mgt) return "getMGTComponent null döndü (klip MGT değil)";
-    if (!mgt.properties) return "MGT properties yok";
+    var mgt = _getMgtComp(clip);
+    if (!mgt)            return "MGT yok → " + _diagClip(clip) + (_lastTextErr ? " || " + _lastTextErr : "");
+    if (!mgt.properties) return "properties yok → " + _diagClip(clip);
     var n = mgt.properties.numItems;
     var out = ["(" + n + " param)"];
     for (var i = 0; i < n && i < 25; i++) {
-      var p = mgt.properties[i];
       var nm = "?";
-      try { nm = String(p.displayName); } catch (e1) {}
+      try { nm = String(mgt.properties[i].displayName); } catch (e1) {}
       out.push(i + ":'" + nm + "'");
     }
-    return out.join(" ");
+    return out.join(" ") +
+           (_lastTextErr ? "  || setErr: " + _lastTextErr : "") +
+           (_lastGetType ? "  || getType:" + _lastGetType + " sample:" + _lastGetSample : "");
   } catch (e) { return "teşhis hatası: " + e.message; }
 }
 
@@ -1052,10 +1535,14 @@ function goToTime(seconds) {
  *
  * @returns {string} JSON — { success, fonts: [{file, name, weight, style}] }
  */
-function getAvailableFonts() {
+function getAvailableFonts(extPathHint) {
   try {
-    var extPath = $.fileName;
-    var extDir  = new File(extPath).parent.parent;  // host/../ → kök dizin
+    var extDir;
+    if (extPathHint && extPathHint.length > 0) {
+      extDir = new Folder(extPathHint);  // client'tan gelen güvenilir yol
+    } else {
+      extDir = new File($.fileName).parent.parent;  // yedek: $.fileName (güvenilmez)
+    }
     var fontDir = new Folder(extDir.absoluteURI + "/fonts");
 
     if (!fontDir.exists) {
