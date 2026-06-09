@@ -33,3 +33,8 @@ dist/
 # Secrets and Config
 .env
 .secret.key
+
+# Installer build artifacts
+installer/dist/
+installer/cert/
+installer/node_modules/

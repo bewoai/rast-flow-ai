@@ -12,6 +12,59 @@
 
 'use strict';
 
+const APP_VERSION = '1.0.0';
+const GITHUB_REPO = 'bewoai/rast-flow-ai';
+
+/* ── Güncelleme Kontrolü ── */
+const UpdateChecker = (() => {
+  async function check() {
+    try {
+      const https = require('https');
+      const data = await new Promise((resolve, reject) => {
+        const req = https.get({
+          hostname: 'api.github.com',
+          path: `/repos/${GITHUB_REPO}/releases/latest`,
+          headers: { 'User-Agent': 'RastFlowAI/' + APP_VERSION }
+        }, res => {
+          let raw = '';
+          res.on('data', c => raw += c);
+          res.on('end', () => {
+            try { resolve(JSON.parse(raw)); }
+            catch (e) { reject(e); }
+          });
+        });
+        req.on('error', reject);
+        req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
+      });
+
+      if (!data || !data.tag_name) return null;
+      const latest = data.tag_name.replace(/^v/i, '');
+      if (_isNewer(latest, APP_VERSION)) {
+        const asset = (data.assets || []).find(a => a.name && a.name.endsWith('.zxp'));
+        return {
+          version: latest,
+          notes: data.body || '',
+          downloadUrl: asset ? asset.browser_download_url : data.html_url,
+          pageUrl: data.html_url
+        };
+      }
+      return null;
+    } catch (e) { return null; }
+  }
+
+  function _isNewer(remote, local) {
+    const r = remote.split('.').map(Number);
+    const l = local.split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+      if ((r[i] || 0) > (l[i] || 0)) return true;
+      if ((r[i] || 0) < (l[i] || 0)) return false;
+    }
+    return false;
+  }
+
+  return { check, currentVersion: APP_VERSION };
+})();
+
 /* ══════════════════════════════════════════════════════════════════
    A. APIManager  –  Whisper API + AES-256 API Key Şifreleme
    ══════════════════════════════════════════════════════════════════ */
@@ -2701,6 +2754,32 @@ const UIController = (() => {
   let _previewAutoLoaded = false;
 
   function init() {
+    // Versiyon göster
+    const verEl = document.getElementById('appVersion');
+    if (verEl) verEl.textContent = 'v' + APP_VERSION;
+
+    // Güncelleme kontrolü (arka planda, sessiz)
+    setTimeout(async () => {
+      try {
+        const update = await UpdateChecker.check();
+        if (update) {
+          log('🆕 Yeni sürüm mevcut: v' + update.version + ' (mevcut: v' + APP_VERSION + ')', 'warn');
+          const updateBar = document.getElementById('updateBar');
+          if (updateBar) {
+            updateBar.style.display = 'flex';
+            const verLabel = document.getElementById('updateVersion');
+            if (verLabel) verLabel.textContent = 'v' + update.version;
+            const dlBtn = document.getElementById('updateDownloadBtn');
+            if (dlBtn) dlBtn.addEventListener('click', () => {
+              try { require('child_process').exec('start "" "' + update.pageUrl + '"'); }
+              catch (e) { window.open(update.pageUrl, '_blank'); }
+            });
+          }
+          toast('Yeni güncelleme: v' + update.version + ' — Ayarlar\'dan indirin.', 'warn');
+        }
+      } catch (e) {}
+    }, 3000);
+
     // Tab sistemi
     document.querySelectorAll('.tab').forEach(tab => {
       tab.addEventListener('click', () => {

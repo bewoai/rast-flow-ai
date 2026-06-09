@@ -13,9 +13,17 @@
   <!-- ── Header ───────────────────────────────────────────── -->
   <div class="header">
     <img src="./assets/logo.png" alt="Rast Flow AI" class="header-logo-img" id="headerLogo">
+    <span id="appVersion" style="font-size:9px;color:var(--text-3);margin-left:4px;opacity:.6;">v1.0.0</span>
     <div class="header-spacer"></div>
     <div class="icon-btn" id="reloadBtn" title="Paneli yenile" role="button" tabindex="0" aria-label="Paneli Yenile">↻</div>
     <div class="icon-btn" id="settingsBtn" title="Ayarlar" role="button" tabindex="0" aria-label="Ayarlar">⚙</div>
+  </div>
+
+  <!-- Güncelleme bildirimi -->
+  <div id="updateBar" style="display:none;align-items:center;gap:8px;padding:6px 12px;background:var(--yellow);color:#000;font-size:11px;font-weight:600;border-radius:0 0 6px 6px;">
+    🆕 Yeni sürüm: <span id="updateVersion"></span>
+    <div style="flex:1;"></div>
+    <button id="updateDownloadBtn" style="background:#000;color:#fff;border:none;padding:3px 10px;border-radius:4px;font-size:10px;cursor:pointer;">İndir</button>
   </div>
 
   <!-- ── Tab strip ────────────────────────────────────────── -->

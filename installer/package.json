@@ -1,0 +1,15 @@
+{
+  "name": "rastflow-ai-installer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rast Flow AI — ZXP build & release tools",
+  "scripts": {
+    "build": "node build.js",
+    "cert": "node build.js --cert-only",
+    "release": "node build.js --release"
+  },
+  "devDependencies": {
+    "archiver": "^6.0.1",
+    "zxp-sign-cmd": "^1.1.1"
+  }
+}
