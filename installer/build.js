@@ -156,18 +156,41 @@ async function main() {
 
   signZxp(stagingDir, zxpPath);
 
-  // 4) Temizle
+  // 4) Dağıtım ZIP oluştur (install.bat + dosyalar + uninstall.bat)
+  const zipName = `RastFlowAI_v${version}_Setup.zip`;
+  const zipPath = path.join(DIST, zipName);
+  if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath);
+
+  console.log('\n📦 Dağıtım ZIP oluşturuluyor…');
+  const zipStaging = path.join(DIST, '_zip_staging');
+  prepareStaging(zipStaging);
+
+  // install/uninstall scriptlerini ekle
+  fs.copyFileSync(path.join(__dirname, 'install.bat'), path.join(zipStaging, 'install.bat'));
+  fs.copyFileSync(path.join(__dirname, 'uninstall.bat'), path.join(zipStaging, 'uninstall.bat'));
+
+  await new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    output.on('close', resolve);
+    archive.on('error', reject);
+    archive.pipe(output);
+    archive.directory(zipStaging, false);
+    archive.finalize();
+  });
+
+  fs.rmSync(zipStaging, { recursive: true, force: true });
   fs.rmSync(stagingDir, { recursive: true, force: true });
 
   // 5) Sonuç
-  const size = (fs.statSync(zxpPath).size / 1048576).toFixed(1);
+  const zxpSize = (fs.statSync(zxpPath).size / 1048576).toFixed(1);
+  const zipSize = (fs.statSync(zipPath).size / 1048576).toFixed(1);
   console.log('');
   console.log('✅ Hazır!');
-  console.log(`   📁 ${zxpPath}`);
-  console.log(`   📏 ${size} MB`);
+  console.log(`   📁 ${zxpPath}  (${zxpSize} MB) — ZXP Installer ile kurulum`);
+  console.log(`   📁 ${zipPath}  (${zipSize} MB) — ZIP aç + install.bat çift tıkla`);
   console.log('');
-  console.log('Kurulum: ZXP Installer veya Anastasiy Extension Manager ile yükleyin.');
-  console.log('GitHub Release: bu dosyayı release asset olarak yükleyin.');
+  console.log('GitHub Release: her iki dosyayı da release asset olarak yükleyin.');
   console.log('');
 }
 
