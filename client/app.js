@@ -2291,12 +2291,12 @@ const SubtitleEngine = (() => {
         return;
       }
 
-      // line modu — maks 6 kelime / 30 karakter (MOGRT kutusuna sığması için)
+      // line modu — maks 10 kelime / 60 karakter (paragraph kutusu 2. satıra sarar)
       let i = 0;
       while (i < group.length) {
         const slice = [];
         let chars = 0;
-        while (i < group.length && slice.length < 6 && (chars + group[i].word.length + 1) <= 30) {
+        while (i < group.length && slice.length < 10 && (chars + group[i].word.length + 1) <= 60) {
           chars += group[i].word.length + 1;
           slice.push(group[i]);
           i++;
