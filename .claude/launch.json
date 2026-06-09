@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "rast-flow-ui",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "-s", "client", "-l", "5500", "--no-clipboard"],
+      "port": 5500
+    }
+  ]
+}

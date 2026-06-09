@@ -2263,6 +2263,7 @@ const SubtitleEngine = (() => {
       textMethod  : fillRes.textMethod || 'none',
       filledCount : fillRes.filledCount || 0,
       paramDiag   : fillRes.paramDiag || '',
+      paramDump   : fillRes.paramDump || '',
       note        : fillRes.note || importRes.note || ''
     };
   }
@@ -2892,9 +2893,13 @@ const UIController = (() => {
     const genSubBtn = document.getElementById('generateSubtitlesBtn');
     if (genSubBtn) genSubBtn.addEventListener('click', _onGenerateSubtitles);
 
-    // Altyazıyı timeline'a bas (PNG burn-in — güvenilir, MOGRT'a gerek yok)
+    // Altyazıyı timeline'a bas — MOGRT şablonuyla (AutoCut tarzı, düzenlenebilir)
     const injectBtn = document.getElementById('injectTimelineBtn');
-    if (injectBtn) injectBtn.addEventListener('click', _onBurnCaptions);
+    if (injectBtn) injectBtn.addEventListener('click', _onInjectTimeline);
+
+    // PNG burn-in (görüntü tabanlı yedek)
+    const burnBtn = document.getElementById('burnCaptionsBtn');
+    if (burnBtn) burnBtn.addEventListener('click', _onBurnCaptions);
 
     // Düzenlenebilir altyazı (yerel caption track)
     const editCapBtn = document.getElementById('editableCaptionsBtn');
@@ -3604,7 +3609,7 @@ const UIController = (() => {
   }
 
   async function _onBurnCaptions() {
-    const btn = document.getElementById('injectTimelineBtn');
+    const btn = document.getElementById('burnCaptionsBtn');
     if (btn) btn.disabled = true;
     _showLoading(true);
     try {
@@ -3675,6 +3680,8 @@ const UIController = (() => {
           toast('Klipler kondu ama METİN doldurulamadı — teşhis Günlük\'e yazıldı.', 'warn');
           log('MOGRT teşhis: ' + (result.paramDiag || '(yok)'), 'warn');
         }
+        // Parametre dökümü — panel'e bağlamak için (renk/opaklık/stroke setValue formatları)
+        if (result.paramDump) log('MOGRT paramlar: ' + result.paramDump, 'info');
       } else if (result.success && result.createdCount === 0) {
         toast('Hiç klip oluşturulamadı: ' + (result.note || 'bilinmeyen'), 'warn');
         log('MOGRT 0 klip. Not: ' + (result.note || '—'), 'warn');

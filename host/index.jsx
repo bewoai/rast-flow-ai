@@ -277,9 +277,13 @@ function getTimelineAudioSegments(scope) {
   }
 }
 
-/** Aralık için hedef ses kanalı: önce seçili ses klibinin kanalı, yoksa aralıkta klibi olan ilk kanal. */
+/** Aralık için hedef ses kanalı:
+ *  1) Kullanıcının seçtiği ses klibi → o kanal
+ *  2) Video projesinden gelen (linked) ses klipleri → konuşma olma ihtimali yüksek
+ *  3) Herhangi bir ses klibinin bulunduğu ilk kanal (fallback)
+ */
 function _audioTrackForRange(seq, rStart, rEnd) {
-  // 1) Kullanıcının seçtiği ses klibinin kanalı
+  // 1) Seçili ses klibi
   for (var t = 0; t < seq.audioTracks.numTracks; t++) {
     var tr = seq.audioTracks[t];
     for (var c = 0; c < tr.clips.numItems; c++) {
@@ -292,13 +296,31 @@ function _audioTrackForRange(seq, rStart, rEnd) {
       } catch (e2) {}
     }
   }
-  // 2) Aralıkta klibi olan ilk (en alttaki, A1) ses kanalı — konuşma genelde A1
+
+  // 2) Video-linked audio (konuşma): projectItem'ın hasVideoStream'ı varsa
   for (var t2 = 0; t2 < seq.audioTracks.numTracks; t2++) {
     var tr2 = seq.audioTracks[t2];
     for (var c2 = 0; c2 < tr2.clips.numItems; c2++) {
       var cl2 = tr2.clips[c2];
       var s2 = _toSeconds(cl2.start), e2 = _toSeconds(cl2.end);
-      if (s2 < rEnd && e2 > rStart && cl2.projectItem) return t2;
+      if (s2 < rEnd && e2 > rStart && cl2.projectItem) {
+        try {
+          // Video stream'i olan medya = kamera kaydı = konuşma
+          var hasVideo = cl2.projectItem.hasVideoStream;
+          if (typeof hasVideo === "function") hasVideo = cl2.projectItem.hasVideoStream();
+          if (hasVideo) return t2;
+        } catch (e3) {}
+      }
+    }
+  }
+
+  // 3) Fallback: aralıkta klip olan ilk kanal
+  for (var t3 = 0; t3 < seq.audioTracks.numTracks; t3++) {
+    var tr3 = seq.audioTracks[t3];
+    for (var c3 = 0; c3 < tr3.clips.numItems; c3++) {
+      var cl3 = tr3.clips[c3];
+      var s3 = _toSeconds(cl3.start), e3 = _toSeconds(cl3.end);
+      if (s3 < rEnd && e3 > rStart && cl3.projectItem) return t3;
     }
   }
   return -1;
@@ -1112,11 +1134,34 @@ function fillMogrtTextsByTime(segmentsJSON, trackIndexStr) {
       total      : segments.length,
       notReady   : notReady,
       textMethod : textMethod,
-      paramDiag  : paramDiag
+      paramDiag  : paramDiag,
+      paramDump  : firstClip ? _dumpMogrtParams(firstClip) : ""
     });
   } catch (e) {
     return JSON.stringify({ success: false, error: e.message });
   }
+}
+
+/** Teşhis: MOGRT'ın TÜM parametrelerini ad=tip(örnek) olarak dök — panel'e bağlamak için. */
+function _dumpMogrtParams(clip) {
+  try {
+    var mgt = _getMgtComp(clip);
+    if (!mgt || !mgt.properties) return "comp/props yok";
+    var n = mgt.properties.numItems, out = [];
+    for (var i = 0; i < n && i < 30; i++) {
+      var pr = mgt.properties[i], nm = "?", tp = "?", sm = "";
+      try { nm = String(pr.displayName); } catch (e1) {}
+      try {
+        var v = pr.getValue();
+        tp = (v === null) ? "null" : typeof v;
+        if (tp === "string") sm = String(v).substring(0, 70);
+        else if (v && tp === "object") sm = (v.length !== undefined ? "[arr len " + v.length + ": " + String(v).substring(0, 40) + "]" : "{obj}");
+        else sm = String(v);
+      } catch (e2) { tp = "err"; sm = e2.message; }
+      out.push(i + ":'" + nm + "'=" + tp + "(" + sm + ")");
+    }
+    return out.join("  ||  ");
+  } catch (e) { return "dump err: " + e.message; }
 }
 
 /** Eklentinin templates/ klasöründe caption.mogrt'ı bulur. */
@@ -1250,11 +1295,19 @@ function _trySetProp(p, text) {
   try { got = p.getValue(); gotType = (got === null) ? "null" : typeof got; }
   catch (eG) { errs.push("getValue:" + eG.message); }
 
-  // Teşhis: getValue() ne döndürdü? (metin dolmazsa Günlük'e yazılır)
+  // Teşhis: getValue() ne döndürdü? JSON ise ANAHTARLARI da yaz (görünüm alanlarını
+  // — strokeColor/fillColor/fontSize/font vs. — keşfedip panelden sürmek için).
   _lastGetType = gotType;
   try {
-    if (gotType === "string")              _lastGetSample = String(got).substring(0, 280);
-    else if (got && gotType === "object")  _lastGetSample = "{" + _objKeys(got) + "}";
+    if (gotType === "string") {
+      var sample = String(got).substring(0, 220);
+      try {
+        var pj = JSON.parse(got);
+        if (pj && typeof pj === "object") sample = "KEYS{" + _objKeys(pj) + "} | " + sample;
+      } catch (ePJ) {}
+      _lastGetSample = sample;
+    }
+    else if (got && gotType === "object") _lastGetSample = "{" + _objKeys(got) + "}";
     else                                   _lastGetSample = String(got);
   } catch (eS) { _lastGetSample = "?"; }
 
@@ -1269,15 +1322,32 @@ function _trySetProp(p, text) {
     if (!changed) errs.push("obj: metin alanı yok");
   }
 
-  // B) JSON string (MOGRT source-text en yaygın biçimi: serileştirilmiş metin)
+  // B) JSON string — AE-MOGRT source-text'in BELGELENMİŞ biçimi.
+  //    Doğru yol: textEditValue + fontTextRunLength=[uzunluk] (Adobe community).
   if (gotType === "string" && got.length > 1) {
     var c0 = got.charAt(0);
     if (c0 === "{" || c0 === "[") {
       try {
         var obj = JSON.parse(got);
-        if (_replaceTextInObj(obj, text)) {
-          if (_setVal(p, JSON.stringify(obj), errs)) return true;
-        } else { errs.push("json: metin alanı bulunamadı"); }
+        var didSet = false;
+        if (obj.textEditValue !== undefined) {
+          obj.textEditValue = text;
+          // TÜM biçim run-length dizilerini tek run'a (=metin uzunluğu) ayarla.
+          // Böylece font/renk/STROKE biçimi yeni metnin tamamına taşınır.
+          var L = text.length, setAny = false;
+          for (var rk in obj) {
+            if (!obj.hasOwnProperty(rk)) continue;
+            if (/runlength$/i.test(rk) && obj[rk] && obj[rk].length !== undefined && typeof obj[rk] !== "string") {
+              obj[rk] = [L]; setAny = true;
+            }
+          }
+          if (!setAny) obj.fontTextRunLength = [L];   // hiç run-length yoksa en azından bunu ver
+          didSet = true;
+        } else if (_replaceTextInObj(obj, text)) {
+          didSet = true;
+        }
+        if (didSet && _setVal(p, JSON.stringify(obj), errs)) return true;
+        if (!didSet) errs.push("json: textEditValue/metin alanı yok");
       } catch (eJ) { errs.push("jsonParse:" + eJ.message); }
     }
   }
@@ -1299,7 +1369,7 @@ function _setVal(p, val, errs) {
 /** Nesnenin ilk ~20 anahtarını virgülle listele (teşhis). */
 function _objKeys(o) {
   var ks = [];
-  try { for (var k in o) { if (o.hasOwnProperty(k)) { ks.push(k); if (ks.length >= 20) break; } } } catch (e) {}
+  try { for (var k in o) { if (o.hasOwnProperty(k)) { ks.push(k); if (ks.length >= 45) break; } } } catch (e) {}
   return ks.join(",");
 }
 
@@ -1347,7 +1417,7 @@ function _replaceTextInObj(obj, newText) {
 function _mogrtParamNames(clip) {
   try {
     var mgt = _getMgtComp(clip);
-    if (!mgt)            return "MGT yok → " + _diagClip(clip) + (_lastTextErr ? " || " + _lastTextErr : "");
+    if (!mgt)            return "MGT yok (büyük olasılıkla Premiere'de yapılmış şablon — API yalnızca AE'de yapılmış .mogrt'ı destekler) → " + _diagClip(clip) + (_lastTextErr ? " || " + _lastTextErr : "");
     if (!mgt.properties) return "properties yok → " + _diagClip(clip);
     var n = mgt.properties.numItems;
     var out = ["(" + n + " param)"];
