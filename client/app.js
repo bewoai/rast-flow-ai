@@ -2291,20 +2291,33 @@ const SubtitleEngine = (() => {
     });
     const segJSON = JSON.stringify(JSON.stringify(segments));
 
+    // Panel stilini MOGRT'ın açık parametrelerine taşımak için topla
+    const styleForMogrt = {
+      textColor   : _style.color,
+      fontSize    : _style.fontSize,
+      strokeWidth : _style.strokeWidth,
+      strokeColor : _style.strokeColor,
+      bgEnabled   : _style.bgBoxEnabled,
+      bgColor     : _style.bgBoxColor,
+      bgOpacity   : _style.bgBoxOpacity,
+      bgRadius    : _style.bgBoxRadius
+    };
+    const styleJSON = JSON.stringify(JSON.stringify(styleForMogrt));
+
     // ── FAZ 1: tüm MOGRT kliplerini içe aktar ──
     onPhase && onPhase('MOGRT klipleri yerleştiriliyor…');
     const importRes = await evalP(
       `createCaptionGraphicsFromMogrt(${segJSON}, ${JSON.stringify(JSON.stringify(options))})`);
     if (!importRes.success) return importRes;
 
-    // ── FAZ 2: yükleme bitsin diye bekle + metni doldur (retry) ──
+    // ── FAZ 2: yükleme bitsin diye bekle + metni doldur + stili uygula (retry) ──
     let fillRes = { textMethod: 'none', filledCount: 0, total: segments.length, paramDiag: '' };
     const MAX_TRIES = 4;
     for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
       onPhase && onPhase(`Metinler dolduruluyor… (deneme ${attempt}/${MAX_TRIES})`);
       await new Promise(r => setTimeout(r, attempt === 1 ? 1600 : 1400));
       fillRes = await evalP(
-        `fillMogrtTextsByTime(${segJSON}, '${importRes.trackIndex}')`);
+        `fillMogrtTextsByTime(${segJSON}, '${importRes.trackIndex}', ${styleJSON})`);
       if (fillRes.success && fillRes.textMethod && fillRes.textMethod !== 'none') break;
     }
 
@@ -3393,8 +3406,6 @@ const UIController = (() => {
 
       const transcriptTab = document.querySelector('.tab[data-panel="panelTranscript"]');
       if (transcriptTab) transcriptTab.click();
-
-      await _onScanSilences();
 
     } catch (e) {
       toast('Hata: ' + e.message, 'error');

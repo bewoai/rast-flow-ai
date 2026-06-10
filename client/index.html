@@ -31,7 +31,6 @@
     <div class="tab active" data-panel="panelTranscript">Transkript</div>
     <div class="tab"        data-panel="panelEdit">Kurgu</div>
     <div class="tab"        data-panel="panelSubtitle">Altyazı</div>
-    <div class="tab"        data-panel="panelAiEditor">AI Editör</div>
   </div>
 
   <!-- ══════════ PANEL: TRANSKRİPT ══════════ -->
@@ -98,45 +97,6 @@
   <!-- ══════════ PANEL: KURGU ══════════ -->
   <div class="tab-panel" id="panelEdit">
     <div class="scroll">
-
-      <!-- Sessizlik Kaldırma -->
-      <div class="section">
-        <div class="section-title">Sessizlik Kaldırma</div>
-        <div class="row">
-          <div class="field">
-            <label>Eşik Değeri (dB)</label>
-            <input type="number" id="silenceDbThreshold" value="-30" min="-60" max="-10" step="1">
-          </div>
-          <div class="field">
-            <label>Min. Süre (s)</label>
-            <input type="number" id="silenceMinDuration" value="0.4" min="0.1" max="5" step="0.05">
-          </div>
-        </div>
-        <div class="row" style="margin-top:8px;">
-          <div class="field">
-            <label>Tespit edilen</label>
-            <div class="silence-stat-row">
-              <span id="silenceCount" class="silence-stat-val">—</span>
-            </div>
-          </div>
-          <div class="field">
-            <label>Toplam süre</label>
-            <div class="silence-stat-row">
-              <span id="silenceTotalDur" class="silence-stat-val">—</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="silence-help">
-          <span class="silence-help-icon">💡</span>
-          FFmpeg desibel analizini başlatmak için tarama yapın, ardından kesimi uygulamak için Premiere'e gönderin.
-        </div>
-
-        <div class="btn-group" style="margin-top:10px;">
-          <button class="btn btn-secondary btn-full" id="scanSilenceBtn">🔍 Sessizlikleri Tara</button>
-          <button class="btn btn-secondary btn-full" id="deleteAllSilenceBtn">+ Tümünü Listeye Ekle</button>
-        </div>
-      </div>
 
       <!-- Tekrar Avcısı -->
       <div class="section">
@@ -404,57 +364,6 @@
     </div>
   </div>
 
-  <!-- ══════════ PANEL: AI EDİTÖR ══════════ -->
-  <div class="tab-panel" id="panelAiEditor">
-    <div class="scroll">
-
-      <div class="section">
-        <div class="section-title">AI Bağlantısı</div>
-        <div class="field">
-          <label>API Anahtarı</label>
-          <div class="api-key-wrapper">
-            <input type="password" id="aiApiKey" placeholder="sk-… veya sk-ant-…">
-            <button class="btn btn-secondary btn-sm" id="aiKeyToggle" title="Göster">👁</button>
-          </div>
-        </div>
-        <div class="field">
-          <label>Model</label>
-          <select id="aiModelSelect">
-            <option value="gpt-4o">GPT-4o</option>
-            <option value="gpt-4o-mini">GPT-4o Mini</option>
-            <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-            <option value="claude-opus-4-8">Claude Opus 4.8</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-title">AI Temizleme</div>
-        <button class="btn btn-primary btn-full" id="runAiCleanBtn">🪄 Transkripti AI ile Temizle</button>
-        <div id="aiStatusBar" class="hint" style="margin-top:8px;text-align:center;">—</div>
-        <div id="aiStats" class="ai-stats" style="display:none;">
-          <span>Silinen: <b id="aiDeletedCount">0</b></span>
-          <span>Sebep: <b id="aiReasonCount">0</b></span>
-        </div>
-      </div>
-
-      <div class="section" id="aiReasonsSection" style="display:none;">
-        <div class="section-title">Tespit Edilen Kesimler</div>
-        <div id="aiReasonsList" class="ai-reasons-list"></div>
-      </div>
-
-      <div class="section">
-        <div class="section-title">İpucu</div>
-        <div class="silence-help">
-          <span class="silence-help-icon">🤖</span>
-          AI, kekelemeleri, dolgu sesleri ve hatalı çekimleri (multi-take) tespit ederek transkripti temizler.
-          Sonuçları inceleyip onayladıktan sonra <b>Kurgu</b> sekmesinden Premiere'e uygulayabilirsiniz.
-        </div>
-      </div>
-
-    </div>
-  </div>
-
   <!-- ══════════ YAPIŞKAN UYGULA ÇUBUĞU (tüm sekmelerde görünür) ══════════ -->
   <div id="pendingBar" class="pending-bar">
     <div class="pending-info">
@@ -527,6 +436,28 @@
           <option value="fr">Français</option>
           <option value="es">Español</option>
           <option value="auto">Otomatik Algıla</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- AI Düzeltme anahtarı (eski AI Editör sekmesinden taşındı) -->
+    <div class="section">
+      <div class="section-title">AI Düzeltme</div>
+      <div class="field">
+        <label>AI API Anahtarı</label>
+        <div class="api-key-wrapper">
+          <input type="password" id="aiApiKey" placeholder="sk-… veya sk-ant-…">
+          <button class="btn btn-secondary btn-sm" id="aiKeyToggle" title="Göster">👁</button>
+        </div>
+        <div class="hint">Transkriptteki <b>✨ AI Düzelt</b> butonu bu anahtarı kullanır.</div>
+      </div>
+      <div class="field">
+        <label>Model</label>
+        <select id="aiModelSelect">
+          <option value="gpt-4o">GPT-4o</option>
+          <option value="gpt-4o-mini">GPT-4o Mini</option>
+          <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+          <option value="claude-opus-4-8">Claude Opus 4.8</option>
         </select>
       </div>
     </div>

@@ -1098,11 +1098,13 @@ function createCaptionGraphicsFromMogrt(segmentsJSON, optionsJSON) {
  * AYRI, gecikmeli çağrılır (client setTimeout + retry). O ana kadar MOGRT'lar
  * yüklendiğinden getMGTComponent artık component döndürür.
  */
-function fillMogrtTextsByTime(segmentsJSON, trackIndexStr) {
+function fillMogrtTextsByTime(segmentsJSON, trackIndexStr, styleJSON) {
   try {
     var segments = JSON.parse(segmentsJSON);
     var trackIndex = parseInt(trackIndexStr, 10);
     if (isNaN(trackIndex)) trackIndex = 0;
+    var style = null;
+    try { if (styleJSON) style = JSON.parse(styleJSON); } catch (eSt) {}
 
     var seq = app.project.activeSequence;
     if (!seq) return JSON.stringify({ success: false, error: "Aktif sekans yok." });
@@ -1123,6 +1125,9 @@ function fillMogrtTextsByTime(segmentsJSON, trackIndexStr) {
 
       var mm = _setMogrtText(clip, segments[i].text || "");
       if (mm) { filled++; if (textMethod === "none") textMethod = mm; }
+
+      // Panel stilini MOGRT'ın açık parametrelerine uygula (renk/opaklık/yuvarlaklık/stroke + aç-kapa)
+      if (style) { try { _applyMogrtStyle(clip, style); } catch (eAS) {} }
     }
 
     var paramDiag = "";
@@ -1162,6 +1167,66 @@ function _dumpMogrtParams(clip) {
     }
     return out.join("  ||  ");
   } catch (e) { return "dump err: " + e.message; }
+}
+
+/* ── Panel stilini MOGRT'ın AÇIK (exposed) parametrelerine uygula ── */
+
+function _hexRGB(hex) {
+  hex = String(hex || "").replace("#", "");
+  return [parseInt(hex.substr(0, 2), 16) || 0, parseInt(hex.substr(2, 2), 16) || 0, parseInt(hex.substr(4, 2), 16) || 0];
+}
+
+/** MOGRT parametresini display adına göre bul (fuzzy). needles = küçük harf parçalar. */
+function _findParamByName(mgt, needles) {
+  try {
+    if (!mgt || !mgt.properties) return null;
+    var n = mgt.properties.numItems;
+    for (var i = 0; i < n; i++) {
+      var dn = "";
+      try { dn = String(mgt.properties[i].displayName || "").toLowerCase(); } catch (e) {}
+      for (var j = 0; j < needles.length; j++) { if (dn.indexOf(needles[j]) >= 0) return mgt.properties[i]; }
+    }
+  } catch (e2) {}
+  return null;
+}
+
+/** Renk paramı — çoklu format dene (0-1 ve 0-255 dizileri, hex string). */
+function _setColorParam(p, hex) {
+  if (!p) return false;
+  var c = _hexRGB(hex);
+  var tries = [[c[0]/255, c[1]/255, c[2]/255, 1], [c[0]/255, c[1]/255, c[2]/255], [c[0], c[1], c[2], 255], [c[0], c[1], c[2]]];
+  for (var i = 0; i < tries.length; i++) { try { p.setValue(tries[i], true); return true; } catch (e) {} }
+  try { p.setValue("#" + String(hex).replace("#", ""), true); return true; } catch (e2) {}
+  return false;
+}
+
+/** Sayı paramı. */
+function _setNumParam(p, val) {
+  if (!p || val === null || val === undefined) return false;
+  try { p.setValue(val, true); return true; } catch (e1) {}
+  try { p.setValue(val); return true; } catch (e2) {}
+  return false;
+}
+
+/**
+ * Panel stilini MOGRT'ın açık parametrelerine eşler. Param ADINA göre bulur
+ * (AE'de hangi adı verdiysen). Eşleşmezse sessizce atlar (kırılmaz).
+ */
+function _applyMogrtStyle(clip, st) {
+  var mgt = _getMgtComp(clip);
+  if (!mgt || !mgt.properties) return;
+
+  // Arka plan aç/kapa + opaklık (kapalıysa 0; 0-100 varsayımı, EGP'de "% " gösteriyordu)
+  var opP = _findParamByName(mgt, ["background opacity", "arka plan opak", "kutu opak", "bg opacity"]);
+  if (opP) _setNumParam(opP, (st.bgEnabled === false) ? 0 : (st.bgOpacity != null ? st.bgOpacity : 100));
+
+  if (st.bgColor)        { var bcP = _findParamByName(mgt, ["background color", "arka plan reng", "kutu reng", "bg color"]); if (bcP) _setColorParam(bcP, st.bgColor); }
+  if (st.bgRadius != null){ var rP  = _findParamByName(mgt, ["yuvarlak", "background round", "corner radius", "radius"]);     if (rP)  _setNumParam(rP, st.bgRadius); }
+  if (st.strokeWidth != null) { var swP = _findParamByName(mgt, ["stroke width", "stroke kalın", "kenarlık kalın"]);         if (swP) _setNumParam(swP, st.strokeWidth); }
+  if (st.strokeColor)    { var scP = _findParamByName(mgt, ["stroke color", "stroke reng", "kenarlık reng"]);                if (scP) _setColorParam(scP, st.strokeColor); }
+  // Metin rengi / boyut — AE'de ayrı param olarak açıldıysa (yoksa atlanır)
+  if (st.textColor)      { var tcP = _findParamByName(mgt, ["text color", "metin reng", "yazı reng", "altyazı reng"]);       if (tcP) _setColorParam(tcP, st.textColor); }
+  if (st.fontSize != null){ var fsP = _findParamByName(mgt, ["font size", "yazı boyut", "metin boyut"]);                     if (fsP) _setNumParam(fsP, st.fontSize); }
 }
 
 /** Eklentinin templates/ klasöründe caption.mogrt'ı bulur. */
